@@ -1,24 +1,15 @@
 """Seeded Personalized PageRank risk head.
 
-SCOPE LIMITATION #1 (permanent, by design — not something to work around): the
-architecture doc specifies propagation over CO_SPEND + SAME_ENTITY edges. This
-repo never produces SAME_ENTITY edges — that is Dev B's ER pass 2
-(er/embed_cluster.py, out of scope here per CLAUDE.md). This module
-propagates over CO_SPEND only. Also documented in docs/contracts.md.
-
-SCOPE LIMITATION #2 (a consequence of the Phase 2 ER diagnosis, not a bug in
-THIS module): ER pass 1 (argus.er.union_find) currently produces ZERO
-CO_SPEND edges on this dataset. Diagnosed in Phase 2: the only transactions
-with multiple genuinely-distinct input wallets are CoinJoin rounds, which
-pass 1 must skip to avoid over-merging; and the change-address heuristic
-never links two DIFFERENT wallets given how this dataset's generator builds
-"change" (it always returns to the literal same wallet). Net effect: with
-zero CO_SPEND edges, personalized PageRank propagation is currently a no-op
-beyond the seed set itself — every seed keeps its personalization weight,
-every other node gets exactly 0, and "distance from nearest seed" is 0 for
-seeds and undefined (infinite/unreachable) for everyone else. The algorithm
-below is written to propagate correctly the moment CO_SPEND (or a future
-SAME_ENTITY) has real edges — nothing here would need to change for that.
+Propagates over BOTH CO_SPEND (ER pass 1) and SAME_ENTITY (ER pass 2,
+argus.er.embed_cluster) edges — the architecture doc's full spec. Pass 1
+alone produces zero CO_SPEND edges on this dataset (diagnosed in
+docs/WRITEUP.md's Phase 2 section: the only transactions with multiple
+genuinely-distinct input wallets are CoinJoin rounds, which pass 1 must skip
+to avoid over-merging, and the change-address heuristic never links two
+DIFFERENT wallets here), so before pass 2 runs, propagation over an
+all-CO_SPEND, zero-edge subgraph is a no-op beyond the seed set itself.
+Pass 2's SAME_ENTITY edges are what actually give this head graph structure
+to propagate over on this dataset — see docs/contracts.md.
 """
 from __future__ import annotations
 
@@ -35,41 +26,44 @@ DISTANCE_DECAY = 0.5  # explicit per-hop score multiplier, on top of PPR's own i
 class RiskScore:
     node_id: str
     score: float
-    seed_distance: int  # hops to nearest seed over CO_SPEND edges; 0 for a seed itself
+    seed_distance: int  # hops to nearest seed over CO_SPEND/SAME_ENTITY edges; 0 for a seed itself
     nearest_seed: str
     path: list[str]  # nearest_seed -> ... -> node_id
 
 
-def _co_spend_subgraph(g: ig.Graph) -> ig.Graph:
-    """An UNDIRECTED subgraph containing only CO_SPEND edges — co-spending is
-    a symmetric relationship, so PPR/BFS should walk it either way.
+ENTITY_LINK_EDGE_TYPES = ("CO_SPEND", "SAME_ENTITY")
 
-    delete_vertices=True prunes away every node with zero CO_SPEND edges
-    (currently ALL of them, per scope limitation #2 above) rather than
-    keeping the full graph's ~340k vertices around — with zero CO_SPEND
-    edges that turns a mathematically trivial computation (every seed keeps
-    its own weight, nothing else gets any) into an expensive/pathological one:
+
+def _entity_link_subgraph(g: ig.Graph) -> ig.Graph:
+    """An UNDIRECTED subgraph containing only CO_SPEND + SAME_ENTITY edges —
+    both are symmetric "same entity" relationships, so PPR/BFS should walk
+    either direction.
+
+    delete_vertices=True prunes away every node with zero edges of these
+    types rather than keeping the full graph's ~340k vertices around — with
+    few/no such edges (e.g. before ER pass 2 has run) that turns a
+    mathematically trivial computation (every seed keeps its own weight,
+    nothing else gets any) into an expensive/pathological one:
     personalized_pagerank and an all-pairs distance query both scale with
     vertex count, and were observed to consume multiple GB of RAM and hang
     when run over the full disconnected graph instead of the pruned one.
     """
-    edge_ids = [e.index for e in g.es if e["type"] == "CO_SPEND"]
+    edge_ids = [e.index for e in g.es if e["type"] in ENTITY_LINK_EDGE_TYPES]
     sub = g.subgraph_edges(edge_ids, delete_vertices=True)
     return sub.as_undirected(mode="collapse")
 
 
 def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str]) -> list[RiskScore]:
     seed_ids = set(seed_wallet_ids)
-    sub = _co_spend_subgraph(g)
+    sub = _entity_link_subgraph(g)
     names = sub.vs["name"] if sub.vcount() > 0 else []
     name_to_index = {name: i for i, name in enumerate(names)}
 
     raw: list[RiskScore] = []
 
-    # A seed with no CO_SPEND edges at all was pruned out of `sub` entirely —
-    # it trivially gets its own full weight at distance 0, no graph
-    # computation needed (this is the ENTIRE result set while CO_SPEND is
-    # empty, per scope limitation #2).
+    # A seed with no CO_SPEND/SAME_ENTITY edges at all was pruned out of
+    # `sub` entirely — it trivially gets its own full weight at distance 0,
+    # no graph computation needed.
     for wallet_id in seed_ids - set(names):
         raw.append(RiskScore(node_id=wallet_id, score=1.0, seed_distance=0, nearest_seed=wallet_id, path=[wallet_id]))
 
@@ -93,7 +87,7 @@ def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str]) -> list[RiskSco
                 if d < best_dist:
                     best_dist, best_seed_row = d, seed_idx
             if best_seed_row is None or best_dist == float("inf"):
-                continue  # unreachable from any seed over CO_SPEND — no risk signal to report
+                continue  # unreachable from any seed over CO_SPEND/SAME_ENTITY — no risk signal to report
 
             distance = int(best_dist)
             decayed_score = pagerank[v] * (DISTANCE_DECAY**distance)

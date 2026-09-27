@@ -1,23 +1,24 @@
-# ARGUS (Dev A scope) — SIH26146 / NTRO Bitcoin Transaction Monitoring
+# ARGUS — SIH26146 / NTRO Bitcoin Transaction Monitoring
 
-**This repository implements only Dev A's half of the ARGUS project** (team Doomsbyte).
-It does **not** include:
+Team Doomsbyte. Dev A's classical pipeline plus Dev B's Phase 1 (ER pass 2: GraphSAGE +
+HDBSCAN). Still **not** included:
 
-- Dev B's ML detection heads: temporal hetero GAT-v2 encoder, graph autoencoder anomaly
-  detection, GraphSAGE + HDBSCAN entity-resolution pass 2, embedding-similarity pattern
-  detector, attention-based evidence extractor, full rationale-templating engine.
+- Dev B's remaining ML work: the temporal hetero GAT-v2 detection encoder, graph autoencoder
+  anomaly detection, embedding-similarity pattern detector, attention-based evidence extractor,
+  full rationale-templating engine.
 - The Streamlit **dashboard**.
 
-See `CLAUDE.md` for the exact scope boundary and `docs/WRITEUP.md` for the full write-up
-(Dev A's sections; Dev B's are marked TODO, not drafted).
+See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phase 1; the rest of
+Dev B's are marked TODO, not drafted).
 
 ## What this repo does
 
 Synthetic Bitcoin transaction data generation → ingestion (CSV/JSON/XML) → typed dual-layer
-graph construction → classical entity resolution (Union-Find) → node feature engineering →
-classical pattern detection (peeling chains, CoinJoin) → seeded risk propagation (Personalized
-PageRank) → score fusion → `alerts.json`. Everything runs fully offline at runtime — see
-`docs/offline_install.md`.
+graph construction → classical entity resolution pass 1 (Union-Find) → node feature engineering
+→ entity resolution pass 2 (heterogeneous GraphSAGE embeddings + HDBSCAN clustering, merging or
+splitting pass 1's clusters) → classical pattern detection (peeling chains, CoinJoin) → seeded
+risk propagation over `CO_SPEND` + `SAME_ENTITY` edges (Personalized PageRank) → score fusion →
+`alerts.json`. Everything runs fully offline at runtime — see `docs/offline_install.md`.
 
 ## Install
 
@@ -39,10 +40,13 @@ call.
 make pipeline
 ```
 
-Runs the full chain: `data → ingest → graph → er → features → detect → fusion`, producing
+Runs the full chain: `data → ingest → graph → er → features → er2 → detect → fusion`, producing
 `data/artifacts/alerts.json` as the final output. Each stage can also be run individually
-(`make data`, `make ingest`, `make graph`, `make er`, `make features`, `make detect`,
-`make fusion`) — each depends on the previous stage's output via the Makefile.
+(`make data`, `make ingest`, `make graph`, `make er`, `make features`, `make er2`, `make detect`,
+`make fusion`) — each depends on the previous stage's output via the Makefile. `er2` is ER pass
+2 (`argus.er.cli embed`): GraphSAGE + HDBSCAN, reconciled against pass 1's `entities.parquet` —
+see `docs/WRITEUP.md`'s "Entity resolution pass 2" section for its measured result and a
+diagnosed root cause for why it doesn't yet meaningfully improve on pass 1 on this dataset.
 
 `configs/default.yaml` controls the generated scale and noise/difficulty knobs (`ip_noise`,
 `heuristic_break_rate`, `mixer_fraction`); see `docs/WRITEUP.md`'s "Scale tested" section for
@@ -86,11 +90,17 @@ make test
 
 - **ER pass 1 currently has 0.0 recall** on this dataset — a verified, diagnosed finding, not
   an oversight. See `docs/WRITEUP.md`'s "Entity resolution" section.
-- **The risk head's `CO_SPEND`-only propagation is currently a no-op** beyond the seed set
-  itself, a direct consequence of the ER finding above. Documented in
-  `src/argus/detectors/risk_ppr.py` and `docs/contracts.md`.
+- **ER pass 2 (GraphSAGE + HDBSCAN) runs correctly but stays near-0 recall on this dataset too**
+  — the algorithm itself is verified correct against a hand-built fixture; the real-dataset
+  weakness has a diagnosed root cause (an `IP`-node graph-topology limitation, not a bug in the
+  ER code) with a concrete, out-of-scope-for-this-phase fix identified. See `docs/WRITEUP.md`'s
+  "Entity resolution pass 2" section and `src/argus/er/embed_cluster.py`'s module docstring.
+- **The risk head now propagates beyond the seed set** via pass 2's `SAME_ENTITY` edges (it no
+  longer reduces to a no-op), but inherits pass 2's weak signal above — not a separate issue in
+  `src/argus/detectors/risk_ppr.py`. See `docs/contracts.md`.
 - **The dual-layer vs on-chain-only ablation shows no measurable difference** — verified: none
   of this repo's classical detectors read `BROADCAST_VIA`/`RESOLVES_TO` edges or the
-  cross-layer `f_*` features. See `docs/WRITEUP.md`'s "Ablation" section.
+  cross-layer `f_*` features. See `docs/WRITEUP.md`'s "Ablation" section. (Unaffected by ER pass
+  2, which is a distinct, non-classical stage.)
 - **`artifacts/scores_anomaly.parquet` is a documented placeholder** (fixed 0.5 for every
   node), not a real anomaly model — Dev B's `models/anomaly.py` is out of scope here.

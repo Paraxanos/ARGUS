@@ -9,7 +9,7 @@ endif
 PY_CREATE := $(shell command -v py >/dev/null 2>&1 && echo "py -3.12" || echo python3)
 PY := $(shell if [ -x "$(VENV_BIN)/python" ] || [ -x "$(VENV_BIN)/python.exe" ]; then echo "$(VENV_BIN)/python"; else echo python; fi)
 
-.PHONY: env test data ingest graph er features detect fusion eval pipeline
+.PHONY: env test data ingest graph er features er2 detect fusion eval pipeline
 
 env:
 	$(PY_CREATE) -m venv $(VENV)
@@ -28,13 +28,22 @@ ingest: data
 graph: ingest
 	PYTHONPATH=src "$(PY)" -m argus.graph.cli
 
+# "resolve" named explicitly: argus.er.cli now has two commands (resolve =
+# pass 1, embed = pass 2 below), so typer requires the subcommand name once
+# there's more than one registered.
 er: graph
-	PYTHONPATH=src "$(PY)" -m argus.er.cli
+	PYTHONPATH=src "$(PY)" -m argus.er.cli resolve
 
 features: er
 	PYTHONPATH=src "$(PY)" -m argus.features.cli
 
-detect: features
+# ER pass 2 (GraphSAGE + HDBSCAN, Dev B): needs node_features.parquet (built
+# from pass 1's entities.parquet) as its embedding input, and runs before
+# detect so the risk head sees SAME_ENTITY edges alongside CO_SPEND.
+er2: features
+	PYTHONPATH=src "$(PY)" -m argus.er.cli embed
+
+detect: er2
 	PYTHONPATH=src "$(PY)" -m argus.detectors.cli
 
 fusion: detect
