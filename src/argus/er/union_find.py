@@ -107,9 +107,13 @@ def resolve_entities(df: pd.DataFrame) -> tuple[UnionFind, list[tuple[str, str, 
     return uf, links
 
 
-def add_co_spend_edges(g: ig.Graph, links: list[tuple[str, str, float]]) -> ig.Graph:
-    """Adds one CO_SPEND edge per distinct wallet pair discovered by
-    resolve_entities (deduplicated — a pair can be linked by many transactions).
+def add_wallet_link_edges(g: ig.Graph, links: list[tuple[str, str, float]], edge_type: str) -> ig.Graph:
+    """Adds one wallet<->wallet edge of the given type per distinct pair in
+    `links` (deduplicated — a pair may be linked by more than one source
+    fact, e.g. several co-spending transactions). Shared by ER pass 1
+    (CO_SPEND, via add_co_spend_edges below) and ER pass 2
+    (SAME_ENTITY, via argus.er.embed_cluster.add_same_entity_edges) — same
+    edge shape, different type/provenance.
     """
     name_to_index = {name: i for i, name in enumerate(g.vs["name"])}
 
@@ -131,12 +135,19 @@ def add_co_spend_edges(g: ig.Graph, links: list[tuple[str, str, float]]) -> ig.G
 
     start_eid = g.ecount()
     g.add_edges(new_edges)
-    g.es[start_eid:]["type"] = ["CO_SPEND"] * len(new_edges)
+    g.es[start_eid:]["type"] = [edge_type] * len(new_edges)
     g.es[start_eid:]["confidence"] = new_confidences
     for attr in ("amount", "timestamp", "port"):
         if attr in g.es.attribute_names():
             g.es[start_eid:][attr] = [None] * len(new_edges)
     return g
+
+
+def add_co_spend_edges(g: ig.Graph, links: list[tuple[str, str, float]]) -> ig.Graph:
+    """Adds one CO_SPEND edge per distinct wallet pair discovered by
+    resolve_entities (deduplicated — a pair can be linked by many transactions).
+    """
+    return add_wallet_link_edges(g, links, "CO_SPEND")
 
 
 def write_entities_parquet(uf: UnionFind, path: Path) -> None:

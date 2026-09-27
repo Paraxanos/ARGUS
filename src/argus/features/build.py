@@ -35,9 +35,12 @@ import pandas as pd
 from argus.er.union_find import is_coinjoin_like
 
 # The graph's full edge-type vocabulary (docs/contracts.md), hardcoded rather
-# than derived from this run's actual edges — CO_SPEND may have zero edges in a
-# given run (it does, currently) but the column must still exist.
-EDGE_TYPES = ["FUNDS", "PAYS", "BROADCAST_VIA", "RESOLVES_TO", "CO_SPEND"]
+# than derived from this run's actual edges — CO_SPEND/SAME_ENTITY may have
+# zero edges in a given run (a standalone `make features` re-run against a
+# graph.pkl from before ER pass 2 ran, for instance) but the column must
+# still exist, and every edge type actually present in the graph MUST be
+# listed here or _bulk_topology_features's per-type counter raises KeyError.
+EDGE_TYPES = ["FUNDS", "PAYS", "BROADCAST_VIA", "RESOLVES_TO", "CO_SPEND", "SAME_ENTITY"]
 
 
 def _bulk_topology_features(g: ig.Graph) -> pd.DataFrame:

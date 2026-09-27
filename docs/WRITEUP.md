@@ -74,11 +74,70 @@ than a real success. See the Phase 2 commit message and this repo's test suite
 (`tests/test_er.py`) for the same finding, verified directly against the canonical data before
 any code was written to explain it away.
 
-This has a direct, documented downstream consequence: `src/argus/detectors/risk_ppr.py`'s
-seeded Personalized PageRank propagates over `CO_SPEND` edges only (the architecture doc's
-`SAME_ENTITY` edge type is Dev B's, never produced here) — with zero `CO_SPEND` edges, that
-propagation is currently a no-op beyond the seed set itself. `docs/contracts.md` documents
-both limitations explicitly.
+This has a direct downstream consequence, updated by Dev B's Phase 1 below: with zero
+`CO_SPEND` edges, `src/argus/detectors/risk_ppr.py`'s seeded Personalized PageRank has no
+graph structure to propagate over from pass 1 alone — see the "Entity resolution pass 2"
+section for what changes once `SAME_ENTITY` edges exist. `docs/contracts.md` documents the
+current state precisely.
+
+## Entity resolution pass 2 (Dev B, Phase 1)
+
+`src/argus/models/sage.py` trains a heterogeneous GraphSAGE encoder (PyTorch Geometric
+`HeteroConv` of `SAGEConv` per relation, `ToUndirected()`-symmetrized for message passing,
+self-supervised via negative-sampling link prediction) over the full dual-layer graph, using
+`node_features.parquet`'s `f_*` columns directly as input features. `src/argus/er/embed_cluster.py`
+clusters the resulting wallet embeddings with HDBSCAN (`cluster_selection_method="leaf"`,
+`max_cluster_size=500`) and reconciles the result against pass 1's `entities.parquet`: a
+non-noise HDBSCAN cluster spanning more than one pass-1 entity triggers a **merge**; a pass-1
+entity whose wallets land in more than one HDBSCAN bucket triggers a **split**. Every action is
+logged to `artifacts/er_pass2_log.parquet` with its evidence, referenced from
+`entities.parquet`'s `merge_split_log_ref` — see `docs/contracts.md`.
+
+**Algorithm correctness — verified independently of data quality:** a hand-built fixture
+(`tests/test_er_embed_cluster.py::test_merge_and_split_and_noise_all_correct`) with known-correct
+merge, split, and noise cases passes exactly: three singleton pass-1 entities whose embeddings
+cluster together get merged into one; a pre-merged pass-1 entity whose wallets embed into two
+separate clusters gets split into two; an isolated wallet is correctly left as noise, untouched,
+`source` still `"pass1"`. `tests/test_models_sage.py` separately verifies the GraphSAGE encoder
+itself produces valid, non-degenerate embeddings on a toy graph (two wallets sharing a
+transaction/IP neighborhood embed measurably closer to each other than to two wallets in an
+unrelated neighborhood).
+
+**Measured result on the full 200k-tx dataset, and the diagnosed root cause (same standard as
+pass 1's 0.0-recall finding above — verified, not hidden):** pairwise recall against ground
+truth stays near 0 (0.0000-0.0002 across every `min_cluster_size` / `cluster_selection_method` /
+`max_cluster_size` combination tried) despite the algorithm itself being correct. Root cause,
+diagnosed directly: `src/argus/graph/build.py` gives every `IP` node its literal full address,
+and `src/argus/synth/transactions.py` randomizes an IP's last octet per transaction while
+holding the entity's home `/24` fixed — so two transactions from the *same* entity almost never
+broadcast to the *same* IP node (up to 254 distinct last-octet values), even though they share a
+subnet. GraphSAGE's message passing therefore sees an essentially unique `IP` node per
+transaction; the only place same-entity transactions actually meet in the graph is two hops out
+at the shared `ASN` node, diluted by every other entity coincidentally sharing one of only 64
+synthetic ASNs (~31 entities/ASN on average). The `/24`-level affinity the architecture doc
+describes is real in the generator (`src/argus/synth/networks.py`) but not representable through
+current graph topology at a granularity this encoder can exploit. **Not fixed in this phase** —
+the concrete fix is a graph-schema change (an `IP` node keyed by subnet prefix, or a dedicated
+`Subnet` node type, in `graph/build.py`, propagating through `features/build.py`'s IP-based
+features), out of scope here; see `er/embed_cluster.py`'s module docstring for the full
+diagnosis and the same note repeated at the point it matters.
+
+Before landing on `max_cluster_size=500`, an uncapped run (`cluster_selection_method="eom"`,
+sklearn's own default) was measured directly: HDBSCAN merged 49,962 of 49,983 wallets into six
+clusters, corrupting `entities.parquet` far worse than pass 1's inert-but-harmless singleton
+output (precision 0.0040 — i.e. actively wrong, not merely unhelpful). `max_cluster_size` (a
+native `sklearn.cluster.HDBSCAN` parameter, not a hand-rolled post-hoc filter) rejects any
+cluster above that size as noise instead of a real entity — a permanent safety net independent
+of the diagnosis above, since no real entity in this dataset's own ground truth exceeds 308
+wallets. With the guard: 2,135 merges, 9,981 wallets touched, precision 0.0068 — no longer
+corrupting the majority of the population, but not a meaningful improvement over pass 1 either,
+consistent with the root cause above.
+
+**Downstream consequence:** `detectors/risk_ppr.py` now propagates over `SAME_ENTITY` edges
+alongside `CO_SPEND` (see `docs/contracts.md`) — measured: seeds go from 928 rows (no
+propagation, pass 1 alone) to 1,616 scored rows (propagation over 7,846 `SAME_ENTITY` edges).
+The propagation machinery is correctly wired and exercised; its output quality on this dataset
+inherits pass 2's diagnosed weakness above, not a separate issue in `risk_ppr.py`.
 
 ## Classical pattern detection
 
@@ -154,14 +213,15 @@ actually run and how, and the codebase audit for accidental network calls.
 
 ---
 
-## Dev B's sections (out of scope in this repo — not drafted)
+## Dev B's sections
 
-- **TODO (Dev B): Temporal hetero GAT-v2 encoder** (`models/encoder.py`)
+- **DONE (Phase 1): ER pass 2 — GraphSAGE + HDBSCAN embedding-based clustering**
+  (`er/embed_cluster.py`, `models/sage.py`) — see "Entity resolution pass 2" above.
+- **TODO (Dev B): Temporal hetero GAT-v2 encoder** (`models/encoder.py`) — note this is a
+  separate model from pass 2's GraphSAGE encoder (architecture doc sec 4.2 vs 4.3): this one
+  feeds the anomaly/pattern/risk detection heads, not entity resolution.
 - **TODO (Dev B): Graph autoencoder anomaly detection** (`models/anomaly.py`) — this repo only
   ships a documented placeholder; see "Score fusion" above and `docs/contracts.md`.
-- **TODO (Dev B): ER pass 2 — GraphSAGE + HDBSCAN embedding-based clustering**
-  (`er/embed_cluster.py`) — would be the natural next step given pass 1's diagnosed 0.0
-  recall on this dataset.
 - **TODO (Dev B): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`)
 - **TODO (Dev B): Attention-based evidence extractor** (`fusion/evidence.py`)
 - **TODO (Dev B): Full rationale-templating engine** (`fusion/rationale.py`) — this repo only

@@ -38,10 +38,13 @@ Artifacts: `artifacts/graph.pkl` + `artifacts/graph_edges.parquet`. Producer: `g
 | `BROADCAST_VIA` | `Tx -> IP` | first-seen relay | `timestamp`, `port` |
 | `RESOLVES_TO` | `IP -> ASN` | geo enrichment | static |
 | `CO_SPEND` | `Wallet <-> Wallet` | ER pass 1, Dev A | `confidence` |
-| `SAME_ENTITY` | `Wallet <-> Wallet` | ER pass 2, Dev B — **NOT produced in this repo** | `confidence` ∈ [0,1] |
+| `SAME_ENTITY` | `Wallet <-> Wallet` | ER pass 2, Dev B (`er/embed_cluster.py`) | `confidence` ∈ [0,1] |
 
-This repo produces `FUNDS`, `PAYS`, `BROADCAST_VIA`, `RESOLVES_TO` (from graph build) and
-`CO_SPEND` (from ER pass 1). `SAME_ENTITY` is never produced here.
+This repo produces every edge type in the table: `FUNDS`, `PAYS`, `BROADCAST_VIA`,
+`RESOLVES_TO` (from graph build), `CO_SPEND` (ER pass 1), and `SAME_ENTITY` (ER pass 2, added
+via `add_same_entity_edges` — same `add_wallet_link_edges` machinery `CO_SPEND` uses, see
+`er/union_find.py`). See `artifacts/entities.parquet` and `artifacts/scores_risk.parquet` below
+for the measured, diagnosed quality of the `SAME_ENTITY` edges on this dataset.
 
 ## `ground_truth/entities.parquet`
 
@@ -68,13 +71,31 @@ Producer: `synth`.
 
 ## `artifacts/entities.parquet`
 
-Producer: ER pass 1 only, in this repo.
+Producer: ER pass 1 (`er/cli.py resolve`), then overwritten in place by ER pass 2
+(`er/cli.py embed`) once it has run — pass 2 reconciles against whatever is currently on disk,
+it never re-derives pass 1 from scratch. Run order matters: `resolve` must run before `embed`
+(the Makefile's `er` -> `features` -> `er2` chain enforces this).
 
 - `wallet_id`
-- `entity_id`
-- `source` (always `"pass1"` here)
-- `conf`
-- `merge_split_log_ref`
+- `entity_id` (pass 1's `resolved_<wallet>` id, or a pass-2 merged/split id — see
+  `er/embed_cluster.py`'s module docstring for the exact algorithm)
+- `source` (`"pass1"` for a wallet pass 2 left untouched, `"pass2"` for one it merged or split)
+- `conf` (pass 1's fixed 1.0/0.85, or — for a `"pass2"` row — the HDBSCAN membership
+  probability from `run_hdbscan`)
+- `merge_split_log_ref` (`null`, or a `log_id` into `artifacts/er_pass2_log.parquet`)
+
+## `artifacts/er_pass2_log.parquet`
+
+Producer: `er/embed_cluster.py`, via `write_pass2_outputs`. One row per merge or split action
+pass 2 applied — every `entities.parquet` row with `source="pass2"` has its `merge_split_log_ref`
+pointing here, per this doc's hard rule below.
+
+- `log_id`
+- `action` (`"merge"` or `"split"`)
+- `hdbscan_cluster` (the HDBSCAN label that triggered a merge; `null` for a split)
+- `pass1_entities` (JSON-encoded list — the pass-1 entity ids involved)
+- `wallets` (JSON-encoded list — every wallet covered by this action)
+- `evidence_json`
 
 ## `artifacts/node_features.parquet`
 
@@ -103,14 +124,17 @@ Producer: `detectors/risk_ppr.py`.
 - `reason_code` (`SEED_DIST=n`)
 - `evidence_json`
 
-**Scope limitation (permanent, by design):** the architecture doc specifies personalized
-PageRank propagation over `CO_SPEND` + `SAME_ENTITY` edges. This repo never produces
-`SAME_ENTITY` edges — that is Dev B's ER pass 2 (`er/embed_cluster.py`, out of scope here).
-`detectors/risk_ppr.py` propagates over `CO_SPEND` only. As of Phase 3, ER pass 1 also
-produces zero `CO_SPEND` edges on this dataset (see the Phase 2 ER precision/recall
-diagnosis), so this head currently reduces to reporting the seed set itself
-(`SEED_DIST=0` for every row) with no further graph propagation — not a bug in
-`risk_ppr.py`, a direct consequence of the upstream `CO_SPEND` count.
+**Status (updated, Dev B Phase 1):** `detectors/risk_ppr.py` now propagates over BOTH
+`CO_SPEND` + `SAME_ENTITY` edges, the architecture doc's full spec — no longer a scope
+limitation. ER pass 1 still produces zero `CO_SPEND` edges on this dataset (unchanged; see the
+Phase 2 ER precision/recall diagnosis), but ER pass 2 (`er/embed_cluster.py`) now supplies
+`SAME_ENTITY` edges, so this head does propagate beyond the seed set (measured: 928 seeds ->
+1,616 scored rows on the full dataset, via 7,846 `SAME_ENTITY` edges). **However**, per
+`er/embed_cluster.py`'s own MEASURED RESULT diagnosis, those `SAME_ENTITY` edges carry weak
+signal on this dataset (pass 2's pairwise recall against ground truth stays ~0), so this
+head's precision@50 is correspondingly not meaningfully better than the pre-pass-2 baseline —
+propagation is happening, but over largely noisy edges. Root cause and fix path are documented
+in `er/embed_cluster.py`'s module docstring, not repeated here.
 
 ## `artifacts/scores_anomaly.parquet`
 

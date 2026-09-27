@@ -61,6 +61,27 @@ attempted to open a socket for any reason (a stray telemetry call, an accidental
 version-check ping, a real GeoIP web-service lookup), that call would have raised immediately
 and the run would have failed with a traceback naming the exact call site. It did not.
 
+## Addendum (Dev B Phase 1): torch / torch_geometric
+
+`requirements.txt` gained `torch` + `torch_geometric` (CPU builds, via
+`--extra-index-url https://download.pytorch.org/whl/cpu`, a requirements-file directive that
+`pip install -r requirements.txt` picks up automatically — no separate install step) for ER
+pass 2's GraphSAGE encoder (`src/argus/models/sage.py`). Covered by the same static-audit
+methodology above: neither package appears in the network-capable-import grep, and both are
+standard local compute libraries with no telemetry/version-check network calls in normal use.
+
+**Windows-only gotcha, unrelated to offline-ness but worth recording here:** importing `torch`
+in the same process *after* `numpy`/`pandas`/`sklearn`/`igraph` have already initialized
+reproducibly crashes with `OSError: [WinError 1114] A dynamic link library (DLL)
+initialization routine failed ... c10.dll` — an OpenBLAS/MKL runtime-init conflict between this
+environment's OpenBLAS-linked scipy/sklearn wheels and torch's bundled runtime, bisected
+directly (not guessed) during Phase 1 development. Importing `torch` (via
+`argus.models.sage`) *first* avoids it entirely. Fixed at both points this matters:
+`src/argus/er/cli.py`'s import order, and `tests/conftest.py` (which guarantees the safe load
+order for the whole test suite regardless of pytest's alphabetical file-collection order). See
+either file's comment for the full explanation; not re-verified on Linux, where this class of
+DLL conflict does not apply the same way.
+
 ## Reproducing this check
 
 The check script is not checked into the repo (it was a one-off verification, not part of the
