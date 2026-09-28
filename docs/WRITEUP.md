@@ -26,10 +26,15 @@ rough scaling estimate for 1M transactions (5x this run):
   backend handles in memory on ordinary hardware, but `node_features.parquet` and
   `graph_edges.parquet` would grow proportionally (a few hundred MB each).
 - The full pipeline (`data` through `fusion`) took 1.5-3.5 minutes wall-clock at 200k
-  transactions on the development machine across several runs; naive linear scaling would put
-  1M transactions at roughly 10-20 minutes, though several stages (ER pass 1's transaction
-  scan, feature engineering's per-wallet grouping) are closer to O(n) than O(n²), so this is
-  a rough upper bound rather than a hard prediction.
+  transactions on the development machine across several Dev-A-only runs; naive linear scaling
+  would put 1M transactions at roughly 10-20 minutes for that portion, though several stages
+  (ER pass 1's transaction scan, feature engineering's per-wallet grouping) are closer to O(n)
+  than O(n²), so this is a rough upper bound rather than a hard prediction.
+- Dev B's Phase 1 (ER pass 2: GraphSAGE training + HDBSCAN) and Phase 2 (anomaly: GAT-v2
+  encoder + autoencoder training) each add roughly 1-1.5 minutes at this scale, measured
+  directly (~60-100s each, CPU-only, no GPU used or required) — both train a small number of
+  full-batch epochs over the full ~343k-node graph, not mini-batched, so this is expected to
+  scale roughly linearly with graph size same as the rest of the pipeline.
 - This was not run. If asked to attempt 1M transactions, expect to hit the Windows long-path
   `pip install` issue documented in the Phase 1 fresh-clone verification again if working from
   a deeply-nested directory — unrelated to scale, but worth flagging alongside it.
@@ -139,6 +144,55 @@ propagation, pass 1 alone) to 1,616 scored rows (propagation over 7,846 `SAME_EN
 The propagation machinery is correctly wired and exercised; its output quality on this dataset
 inherits pass 2's diagnosed weakness above, not a separate issue in `risk_ppr.py`.
 
+## Anomaly detection (Dev B, Phase 2)
+
+`src/argus/models/encoder.py` implements the architecture doc's sec 4.3 shared detection core:
+a **Temporal Heterogeneous GAT-v2 encoder** — `HeteroConv` of `GATv2Conv` per relation (same
+per-relation-weights pattern as pass 2's GraphSAGE, but attention instead of mean/sum
+aggregation), with `BROADCAST_VIA` edges additionally carrying a **Time2Vec**-encoded timestamp
+feature (Kazemi & Poole 2019: one learnable linear term + learnable-frequency periodic terms —
+the learnable-frequency property is what makes it Time2Vec rather than a fixed sinusoidal
+positional encoding) that `GATv2Conv`'s attention conditions on via `edge_dim`. This encoder is
+deliberately **shared** — sec 4.3's stated intent is that anomaly/pattern/risk signals reason
+over the same learned representation; `models/anomaly.py` is its first real consumer.
+
+`src/argus/models/anomaly.py` is a graph autoencoder: the shared encoder produces each node's
+embedding, a per-node-type linear decoder reconstructs that node's own (already z-scored)
+input features, and the whole thing trains end-to-end via MSE. Reconstruction error is
+z-scored **within** each node type (a Wallet's error is only meaningful relative to other
+Wallets — IPs/ASNs have different feature semantics entirely) and squashed to [0,1] via
+sigmoid, exactly matching the architecture doc's "reconstruction error z-scored against
+population" wording.
+
+**Mechanism verified correct, independent of real-dataset quality:** a hand-built fixture — 20
+near-identical "normal" wallets plus one wallet with deliberately wild-magnitude features, all
+with otherwise-identical local graph structure (isolating the signal to features, not topology)
+— is scored correctly: the planted outlier gets the single highest anomaly z-score among all
+wallets, by a wide margin (z=4.47 vs. a normal-population range of roughly -0.24 to -0.21;
+`tests/test_models_anomaly.py`). `tests/test_models_encoder.py` separately verifies the shared
+encoder itself: valid non-NaN embeddings for every node type, the Time2Vec edge feature
+correctly attached to both `BROADCAST_VIA` and its `ToUndirected()`-generated reverse relation
+in matching per-edge order, and — the one failure mode that wouldn't show up as a shape or NaN
+error — gradients actually reaching Time2Vec's learnable parameters (confirming the temporal
+signal is genuinely wired into training, not a silently-disconnected branch).
+
+**Measured result on the full 200k-tx dataset (verified, not assumed — same standard as every
+other finding in this document):** AUC-ROC 0.510 / precision@50 0.30 against
+`ground_truth/entities.parquet`'s illicit labels — essentially chance-level overall ranking,
+with modest lift in the very top scores over the population base rate. This is a real,
+diagnosable gap, not a bug: the mechanism is independently proven correct above, so the
+shortfall is what the mechanism is measuring, not whether it works. Unsupervised
+reconstruction-error anomaly detection answers "is this node statistically unusual" — a
+different question from "is this node one of the specific labeled ransomware/darknet/mixer
+entity types," and on this dataset's current `f_*` feature schema those only partially overlap:
+illicit entities aren't necessarily feature-space outliers (several behave in
+ordinary-looking ways by construction), while legitimate high-volume entities like exchanges
+can be structural outliers without being illicit at all. **Not fixed in this phase** — a
+supervised or semi-supervised variant, or features specifically discriminative of the illicit
+campaign types (rather than the current general topological/temporal/cross-layer set), would be
+the concrete next step; see `docs/contracts.md`'s `scores_anomaly.parquet` section for the same
+diagnosis at the point it matters.
+
 ## Classical pattern detection
 
 `src/argus/detectors/peeling.py` walks `FUNDS`/`PAYS` edges to find single-input,
@@ -194,17 +248,23 @@ based on IP reuse across hops, or an ER heuristic considering shared broadcast i
 
 ## Score fusion
 
-`src/argus/fusion/blend.py` combines `scores_pattern`, `scores_risk`, and a documented,
-explicitly-labeled placeholder `scores_anomaly` (fixed 0.5 for every node — Dev B's
-`models/anomaly.py` is out of scope; see `docs/contracts.md`) via a logistic regression
-calibrated on `ground_truth/entities.parquet`'s labels when enough labeled nodes exist (both
-paths — calibrated and fixed-weight fallback — are implemented and tested). The resulting
-fused-score distribution is bimodal: pattern-only detections cluster near 0.67, risk-only
-detections (currently just the seed set, per the ER finding above) cluster near 0.9998, with
-nothing between. The alert threshold (0.6) was set below both clusters specifically to avoid
-the wrong prioritization a naively "high" threshold would create — it would keep the trivial
-seed-echo cluster while dropping the real structural detections. See `blend.py`'s inline
-comments for the full reasoning.
+`src/argus/fusion/blend.py` combines `scores_pattern`, `scores_risk`, and — as of Dev B Phase
+2 — `scores_anomaly` from a real model (`models/anomaly.py`, see above; no longer the constant
+0.5 placeholder) via a logistic regression calibrated on `ground_truth/entities.parquet`'s
+labels when enough labeled nodes exist (both paths — calibrated and fixed-weight fallback —
+are implemented and tested). Anomaly reason codes now flow into `build_alerts`'s evidence and
+rationale text too, gated by `ANOMALY_NOTABLE_Z` (z > 1.5) so an unremarkable anomaly score
+doesn't produce a misleading "flagged as anomalous" sentence for a node that wasn't — every
+alert's `components.anomaly` value is still always shown regardless.
+
+Measured on the full dataset with the real anomaly model wired in: fusion universe 2,877,
+1,997 alerts at the 0.6 threshold, fused scores ranging 0.257-0.9999 (median 0.661) — broadly
+similar shape to the placeholder-era bimodal distribution (pattern-only detections cluster
+lower, risk/seed detections cluster near-1.0), now with a small amount of continuous spread
+between them contributed by the real (if weak per the section above) anomaly signal, rather
+than every node sharing the exact same anomaly value. The alert threshold (0.6) is unchanged
+from the placeholder era and still sits below the risk/seed cluster for the same reason
+documented then — see `blend.py`'s inline comments for the full reasoning.
 
 ## Offline / install
 
@@ -217,12 +277,13 @@ actually run and how, and the codebase audit for accidental network calls.
 
 - **DONE (Phase 1): ER pass 2 — GraphSAGE + HDBSCAN embedding-based clustering**
   (`er/embed_cluster.py`, `models/sage.py`) — see "Entity resolution pass 2" above.
-- **TODO (Dev B): Temporal hetero GAT-v2 encoder** (`models/encoder.py`) — note this is a
-  separate model from pass 2's GraphSAGE encoder (architecture doc sec 4.2 vs 4.3): this one
-  feeds the anomaly/pattern/risk detection heads, not entity resolution.
-- **TODO (Dev B): Graph autoencoder anomaly detection** (`models/anomaly.py`) — this repo only
-  ships a documented placeholder; see "Score fusion" above and `docs/contracts.md`.
-- **TODO (Dev B): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`)
+- **DONE (Phase 2): Temporal hetero GAT-v2 encoder** (`models/encoder.py`) — a separate model
+  from pass 2's GraphSAGE encoder (architecture doc sec 4.2 vs 4.3): this one feeds the
+  anomaly/pattern/risk detection heads, not entity resolution. See "Anomaly detection" above.
+- **DONE (Phase 2): Graph autoencoder anomaly detection** (`models/anomaly.py`) — replaces the
+  former placeholder entirely (deleted); see "Anomaly detection" above and `docs/contracts.md`.
+- **TODO (Dev B): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`) — the
+  natural next consumer of `models/encoder.py`'s shared embeddings, per architecture sec 4.3.
 - **TODO (Dev B): Attention-based evidence extractor** (`fusion/evidence.py`)
 - **TODO (Dev B): Full rationale-templating engine** (`fusion/rationale.py`) — this repo only
   ships a simple fixed-template rationale string; see `fusion/blend.py`'s docstring.

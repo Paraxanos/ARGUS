@@ -1,15 +1,15 @@
 # ARGUS — SIH26146 / NTRO Bitcoin Transaction Monitoring
 
 Team Doomsbyte. Dev A's classical pipeline plus Dev B's Phase 1 (ER pass 2: GraphSAGE +
-HDBSCAN). Still **not** included:
+HDBSCAN) and Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection).
+Still **not** included:
 
-- Dev B's remaining ML work: the temporal hetero GAT-v2 detection encoder, graph autoencoder
-  anomaly detection, embedding-similarity pattern detector, attention-based evidence extractor,
-  full rationale-templating engine.
+- Dev B's remaining ML work: embedding-similarity pattern detector, attention-based evidence
+  extractor, full rationale-templating engine.
 - The Streamlit **dashboard**.
 
-See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phase 1; the rest of
-Dev B's are marked TODO, not drafted).
+See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-2; the rest
+of Dev B's are marked TODO, not drafted).
 
 ## What this repo does
 
@@ -17,8 +17,10 @@ Synthetic Bitcoin transaction data generation → ingestion (CSV/JSON/XML) → t
 graph construction → classical entity resolution pass 1 (Union-Find) → node feature engineering
 → entity resolution pass 2 (heterogeneous GraphSAGE embeddings + HDBSCAN clustering, merging or
 splitting pass 1's clusters) → classical pattern detection (peeling chains, CoinJoin) → seeded
-risk propagation over `CO_SPEND` + `SAME_ENTITY` edges (Personalized PageRank) → score fusion →
-`alerts.json`. Everything runs fully offline at runtime — see `docs/offline_install.md`.
+risk propagation over `CO_SPEND` + `SAME_ENTITY` edges (Personalized PageRank) → graph
+autoencoder anomaly detection (shared temporal GAT-v2 encoder + per-node-type reconstruction) →
+score fusion → `alerts.json`. Everything runs fully offline at runtime — see
+`docs/offline_install.md`.
 
 ## Install
 
@@ -47,6 +49,10 @@ Runs the full chain: `data → ingest → graph → er → features → er2 → 
 2 (`argus.er.cli embed`): GraphSAGE + HDBSCAN, reconciled against pass 1's `entities.parquet` —
 see `docs/WRITEUP.md`'s "Entity resolution pass 2" section for its measured result and a
 diagnosed root cause for why it doesn't yet meaningfully improve on pass 1 on this dataset.
+`fusion` also trains and scores the graph-autoencoder anomaly head (`argus.models.anomaly`,
+Dev B Phase 2) before combining all three score heads — see `docs/WRITEUP.md`'s "Anomaly
+detection" section. Both `er2` and `fusion` train a small GNN (~60-100s each at this scale,
+CPU-only) — the pipeline is no longer purely classical/instant past `features`.
 
 `configs/default.yaml` controls the generated scale and noise/difficulty knobs (`ip_noise`,
 `heuristic_break_rate`, `mixer_fraction`); see `docs/WRITEUP.md`'s "Scale tested" section for
@@ -101,6 +107,11 @@ make test
 - **The dual-layer vs on-chain-only ablation shows no measurable difference** — verified: none
   of this repo's classical detectors read `BROADCAST_VIA`/`RESOLVES_TO` edges or the
   cross-layer `f_*` features. See `docs/WRITEUP.md`'s "Ablation" section. (Unaffected by ER pass
-  2, which is a distinct, non-classical stage.)
-- **`artifacts/scores_anomaly.parquet` is a documented placeholder** (fixed 0.5 for every
-  node), not a real anomaly model — Dev B's `models/anomaly.py` is out of scope here.
+  2 or the anomaly head, both distinct, non-classical stages — the ablation covers the classical
+  pipeline only, per its own scope.)
+- **The anomaly head (graph autoencoder, `models/anomaly.py`) is a real, verified-correct
+  model** — a planted feature-space outlier is detected with a wide margin on a hand-built
+  fixture — **but stays near chance-level (AUC-ROC 0.51) at ranking the real dataset's specific
+  illicit-entity-type labels**, a diagnosed gap between "statistically unusual" and "one of the
+  labeled illicit types," not a bug. See `docs/WRITEUP.md`'s "Anomaly detection" section and
+  `docs/contracts.md`'s `scores_anomaly.parquet` section.

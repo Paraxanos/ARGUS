@@ -70,7 +70,7 @@ def _toy_features(g: ig.Graph) -> pd.DataFrame:
 def test_build_hetero_data_shapes():
     g = _toy_graph()
     features = _toy_features(g)
-    data, node_ids = build_hetero_data(g, features)
+    data, node_ids, edge_order = build_hetero_data(g, features)
 
     assert set(node_ids["Wallet"]) == {"w0", "w1", "w2", "w3"}
     assert data["Wallet"].x.shape == (4, 2)
@@ -78,6 +78,14 @@ def test_build_hetero_data_shapes():
     # ToUndirected() symmetrizes for message passing; the original directed
     # relations must still be present unchanged for training supervision.
     assert data["Wallet", "FUNDS", "Transaction"].edge_index.shape[1] == 8  # 2 funders x 4 txs
+
+    # edge_order's (source, target) pairs must be in the exact same order as
+    # edge_index's columns — this is the contract argus.models.encoder's
+    # temporal edge features depend on.
+    assert len(edge_order["BROADCAST_VIA"]) == data["Transaction", "BROADCAST_VIA", "IP"].edge_index.size(1)
+    src_idx, dst_idx = data["Transaction", "BROADCAST_VIA", "IP"].edge_index
+    expected = [(node_ids["Transaction"][s], node_ids["IP"][d]) for s, d in zip(src_idx.tolist(), dst_idx.tolist())]
+    assert edge_order["BROADCAST_VIA"] == expected
 
 
 def test_training_produces_valid_wallet_embeddings():

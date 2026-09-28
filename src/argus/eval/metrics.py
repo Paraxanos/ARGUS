@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import igraph as ig
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 
 from argus.detectors.coinjoin import detect_coinjoin_rounds
 from argus.detectors.peeling import detect_peeling_chains
@@ -78,3 +79,34 @@ def risk_metrics(g: ig.Graph, seed_wallets: list[str], ground_truth_entities: pd
     hits = sum(1 for r in top_k if r.node_id in illicit)
     precision_at_k = hits / len(top_k) if top_k else float("nan")
     return {f"risk_precision_at_{k}": precision_at_k}
+
+
+def anomaly_metrics(scores_anomaly: pd.DataFrame, ground_truth_entities: pd.DataFrame, k: int = 50) -> dict:
+    """Unlike every other function in this module, this one reads the
+    PERSISTED scores_anomaly.parquet rather than retraining
+    argus.models.anomaly's autoencoder fresh — deliberately, not an
+    oversight: retraining a GNN takes ~90s at full-dataset scale (verified
+    directly), breaking this module's own "cheap, none of these detectors
+    are slow" assumption, and would make eval's summary describe a
+    DIFFERENT trained model than whatever actually produced alerts.json.
+    Run `make fusion` (or `make pipeline`) first if scores_anomaly.parquet
+    is stale — same requirement this module's docstring already states for
+    every other artifact.
+
+    Restricted to Wallet-type nodes: ground truth entity_type labels are
+    wallet-level, and comparing a Transaction/IP/ASN node's anomaly score
+    against a wallet label would be meaningless.
+    """
+    wallet_scores = scores_anomaly[scores_anomaly["node_id"].isin(ground_truth_entities["wallet_id"])]
+    labels = ground_truth_entities.set_index("wallet_id")["entity_type"].isin(ILLICIT_TYPES)
+
+    merged = wallet_scores.merge(
+        labels.rename("is_illicit"), left_on="node_id", right_index=True, how="inner"
+    )
+    if merged.empty or merged["is_illicit"].nunique() < 2:
+        return {"anomaly_auc_roc": float("nan"), f"anomaly_precision_at_{k}": float("nan")}
+
+    auc = roc_auc_score(merged["is_illicit"], merged["score"])
+    top_k = merged.sort_values("score", ascending=False).head(k)
+    precision_at_k = top_k["is_illicit"].mean() if len(top_k) else float("nan")
+    return {"anomaly_auc_roc": auc, f"anomaly_precision_at_{k}": precision_at_k}

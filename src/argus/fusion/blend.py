@@ -1,13 +1,12 @@
 """Calibrated fusion of the three score heads into artifacts/alerts.json.
 
-This is the one place Dev A's scope hard-depends on Dev B's missing work: the
-anomaly score. scores_anomaly.parquet is produced by
-argus.fusion._anomaly_placeholder, NOT by a real model — see that module's
-docstring and docs/contracts.md.
+scores_anomaly.parquet is now a real model (argus.models.anomaly's graph
+autoencoder, Dev B Phase 2) — see docs/contracts.md and that module's
+docstring for the training/scoring design.
 
 Rationale strings here are a simple, fixed template built from reason_codes
 (architecture-doc §4.4 style) — NOT the full rationale-templating engine,
-which is Dev B's detectors/rationale.py, out of scope in this repo.
+which is Dev B's fusion/rationale.py, out of scope in this repo.
 """
 from __future__ import annotations
 
@@ -17,7 +16,10 @@ from pathlib import Path
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from argus.fusion._anomaly_placeholder import PLACEHOLDER_SCORE
+# Fallback fill for a node with no anomaly row at all (shouldn't happen in
+# practice — argus.models.anomaly scores every node in the graph — kept as a
+# defensive default): 0.5 is "no information either way" on the [0,1] scale.
+NEUTRAL_ANOMALY_SCORE = 0.5
 
 ILLICIT_TYPES = ("ransomware", "darknet", "mixer")
 
@@ -48,21 +50,24 @@ ALERT_THRESHOLD = 0.6
 
 
 def component_table(scores_pattern: pd.DataFrame, scores_risk: pd.DataFrame, scores_anomaly: pd.DataFrame) -> pd.DataFrame:
-    """One row per node with ANY pattern or risk signal. The anomaly
-    placeholder alone (being constant across every graph node) is never a
-    reason to consider a node — including it would blow up the fusion
-    universe to ~340k trivial rows for zero benefit.
+    """One row per node with ANY pattern or risk signal. Anomaly alone is
+    never a reason to consider a node — every one of the graph's ~340k
+    nodes gets an anomaly score (argus.models.anomaly scores the full
+    population), so including it in the universe would blow that up to
+    ~340k trivial rows; it only ever narrows or ranks within the
+    pattern/risk-flagged set, matching the pre-Phase-2 placeholder's
+    behavior exactly (same fusion universe either way).
     """
     pattern_max = scores_pattern.groupby("node_id")["score"].max().rename("pattern")
     risk_max = scores_risk.groupby("node_id")["score"].max().rename("risk")
     universe = pattern_max.index.union(risk_max.index)
 
-    anomaly_by_node = scores_anomaly.set_index("node_id")["score"]
+    anomaly_by_node = scores_anomaly.set_index("node_id")["score"]  # exactly one row per node, by construction
 
     table = pd.DataFrame(index=universe)
     table["pattern"] = pattern_max.reindex(universe).fillna(0.0)
     table["risk"] = risk_max.reindex(universe).fillna(0.0)
-    table["anomaly"] = anomaly_by_node.reindex(universe).fillna(PLACEHOLDER_SCORE)
+    table["anomaly"] = anomaly_by_node.reindex(universe).fillna(NEUTRAL_ANOMALY_SCORE)
     return table.reset_index(names="node_id")
 
 
@@ -104,6 +109,15 @@ def compute_final_scores(table: pd.DataFrame, ground_truth_entities: pd.DataFram
     return table, method
 
 
+# z above this is "worth a rationale clause" (~93rd percentile under a
+# normal assumption) — a defensible "notable" bar, not a rigorous
+# significance test. Every alert's components.anomaly score is shown
+# regardless; this only gates whether the RATIONALE TEXT mentions it, so an
+# unremarkable z-score doesn't produce a misleading "flagged as anomalous"
+# sentence for a node that wasn't.
+ANOMALY_NOTABLE_Z = 1.5
+
+
 def _extract_evidence(reason_code: str, evidence: dict) -> tuple[list[str], list[tuple[str, str]]]:
     if reason_code.startswith("PEEL_CHAIN_HOPS"):
         wallets = evidence.get("wallets", [])
@@ -118,6 +132,11 @@ def _extract_evidence(reason_code: str, evidence: dict) -> tuple[list[str], list
     if reason_code.startswith("SEED_DIST"):
         path = evidence.get("path", [])
         return path, list(zip(path[:-1], path[1:]))
+    if reason_code.startswith("ANOMALY_ZSCORE"):
+        # A reconstruction-error anomaly is a property of the flagged node
+        # itself, not a multi-node structure — nothing to add beyond the
+        # node build_alerts already seeds into its evidence set.
+        return [], []
     return [], []
 
 
@@ -131,6 +150,10 @@ def _rationale(node_id: str, final_score: float, reason_codes: list[str]) -> str
         elif rc.startswith("SEED_DIST="):
             n = rc.split("=")[1]
             clauses.append("a known-illicit seed wallet" if n == "0" else f"{n} hop(s) from a known-illicit seed")
+        elif rc.startswith("ANOMALY_ZSCORE="):
+            z = float(rc.split("=")[1])
+            if z > ANOMALY_NOTABLE_Z:
+                clauses.append(f"a statistical anomaly relative to its population (z-score {z:.2f})")
         else:
             clauses.append(rc)
     body = "; ".join(clauses) if clauses else "no specific structural signal"
@@ -138,18 +161,32 @@ def _rationale(node_id: str, final_score: float, reason_codes: list[str]) -> str
 
 
 def build_alerts(
-    final_table: pd.DataFrame, scores_pattern: pd.DataFrame, scores_risk: pd.DataFrame, threshold: float
+    final_table: pd.DataFrame,
+    scores_pattern: pd.DataFrame,
+    scores_risk: pd.DataFrame,
+    scores_anomaly: pd.DataFrame,
+    threshold: float,
 ) -> list[dict]:
+    # scores_pattern/scores_risk only ever cover nodes with real structural
+    # signal (thousands of rows) — pre-indexing them in full is cheap.
     reasons_by_node: dict[str, list[tuple[str, dict]]] = {}
     for source in (scores_pattern, scores_risk):
         for row in source.itertuples(index=False):
             reasons_by_node.setdefault(row.node_id, []).append((row.reason_code, json.loads(row.evidence_json)))
 
+    # scores_anomaly covers the FULL graph population (~340k rows on the
+    # full dataset) — only look up the handful of flagged nodes below rather
+    # than pre-parsing JSON for the whole table.
+    anomaly_by_node = scores_anomaly.set_index("node_id")
+
     flagged = final_table[final_table["final_score"] >= threshold].sort_values("final_score", ascending=False)
 
     alerts = []
     for i, row in enumerate(flagged.itertuples(index=False)):
-        node_reasons = reasons_by_node.get(row.node_id, [])
+        node_reasons = list(reasons_by_node.get(row.node_id, []))
+        if row.node_id in anomaly_by_node.index:
+            a = anomaly_by_node.loc[row.node_id]
+            node_reasons.append((a["reason_code"], json.loads(a["evidence_json"])))
         reason_codes = [rc for rc, _ in node_reasons]
 
         nodes_ev: set[str] = {row.node_id}

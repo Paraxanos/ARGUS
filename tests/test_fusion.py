@@ -6,10 +6,11 @@ from argus.detectors.coinjoin import detect_coinjoin_rounds
 from argus.detectors.peeling import detect_peeling_chains
 from argus.detectors.risk_ppr import compute_risk_scores, risk_score_rows
 from argus.detectors.scores import coinjoin_round_rows, peeling_chain_rows
-from argus.fusion._anomaly_placeholder import write_anomaly_placeholder
+from argus.features.build import compute_node_features
 from argus.fusion.blend import ALERT_THRESHOLD, build_alerts, component_table, compute_final_scores
 from argus.graph.build import build_graph
 from argus.ingest.pipeline import run_ingest
+from argus.models.anomaly import anomaly_score_rows, train_and_score_anomalies
 from argus.synth.config import SynthConfig
 from argus.synth.corrupt import inject_corruption
 from argus.synth.entities import generate_entities
@@ -56,9 +57,12 @@ def _pipeline_outputs(tmp_path, seed: int = 41):
         risk_score_rows(risk_scores), columns=["node_id", "score", "reason_code", "evidence_json"]
     )
 
-    anomaly_path = tmp_path / "scores_anomaly.parquet"
-    write_anomaly_placeholder(g, anomaly_path)
-    scores_anomaly = pd.read_parquet(anomaly_path)
+    empty_resolved_entities = pd.DataFrame(columns=["wallet_id", "entity_id"])
+    node_features = compute_node_features(g, df, empty_resolved_entities)
+    anomaly_scores = train_and_score_anomalies(g, node_features, max_epochs=10)
+    scores_anomaly = pd.DataFrame(
+        anomaly_score_rows(anomaly_scores), columns=["node_id", "score", "reason_code", "evidence_json"]
+    )
 
     ground_truth_entities_path = tmp_path / "gt_entities.parquet"
     pd.DataFrame(
@@ -79,7 +83,7 @@ def test_alerts_have_evidence_rationale_and_valid_scores(tmp_path):
     final_table, method = compute_final_scores(table, ground_truth_entities)
     assert method in ("calibrated_logistic", "fallback_weighted_average")
 
-    alerts = build_alerts(final_table, scores_pattern, scores_risk, ALERT_THRESHOLD)
+    alerts = build_alerts(final_table, scores_pattern, scores_risk, scores_anomaly, ALERT_THRESHOLD)
     assert alerts
 
     for alert in alerts:

@@ -138,16 +138,35 @@ in `er/embed_cluster.py`'s module docstring, not repeated here.
 
 ## `artifacts/scores_anomaly.parquet`
 
-Producer: `fusion/_anomaly_placeholder.py` — **NOT a real anomaly model**. Dev B's
-`models/anomaly.py` (graph autoencoder) is out of scope in this repo. This file exists
-only so `fusion/blend.py` has a contract-valid input to read: every node gets a fixed
-neutral score of 0.5, `reason_code=ANOMALY_PLACEHOLDER`. When Dev B's real model lands,
-it replaces this file's producer; `blend.py` does not need to change.
+Producer: `fusion/cli.py`, via `argus.models.anomaly.train_and_score_anomalies` (Dev B Phase
+2) — a real graph autoencoder, not a placeholder. Shares `argus.models.encoder`'s temporal
+heterogeneous GAT-v2 encoder (architecture doc sec 4.3) with a per-node-type linear decoder,
+trained to reconstruct each node's own input features; reconstruction error is z-scored within
+its node type and squashed to [0,1] via sigmoid. Covers **every** node in the graph (not just
+pattern/risk-flagged ones) — see `fusion/blend.py`'s `component_table` for why that's safe
+(anomaly alone never expands the fusion universe).
 
 - `node_id`
-- `score` ∈ [0,1] (always exactly 0.5)
-- `reason_code` (always `ANOMALY_PLACEHOLDER`)
-- `evidence_json`
+- `score` ∈ [0,1] (`sigmoid(z_score)`)
+- `reason_code` (`ANOMALY_ZSCORE=<z_score, 2dp>`)
+- `evidence_json` (`z_score`, `raw_reconstruction_error`, `node_type`, `population_mean_error`,
+  `population_std_error`)
+
+**Measured result (full 200k-tx dataset — verified, not assumed, same standard as every other
+finding in this repo):** AUC-ROC 0.510 / precision@50 0.30 against `ground_truth/entities.parquet`'s
+illicit labels — essentially chance-level ranking overall, with modest lift in the very top
+scores. The mechanism itself is independently verified correct: a hand-built fixture with one
+deliberately planted feature-space outlier among 20 near-identical "normal" nodes is scored
+correctly and by a wide margin (`tests/test_models_anomaly.py`). The gap between that and the
+real-dataset result is a real, diagnosable finding, not a bug: this head is *unsupervised*
+reconstruction-error anomaly detection — "statistically unusual" — not a classifier for "is this
+labeled ransomware/darknet/mixer," and those aren't the same thing here. Illicit entities in
+this generator aren't necessarily feature-space outliers on the current `f_*` schema (many
+behave in ordinary-looking ways by construction), while legitimate high-volume entities
+(exchanges) can be structural outliers without being illicit — so high reconstruction error and
+the illicit label only partially overlap. Not fixed here: a supervised or semi-supervised
+variant, or features more specifically discriminative of the illicit campaign types, would be
+the next step, out of this phase's scope.
 
 ## `artifacts/alerts.json`
 
