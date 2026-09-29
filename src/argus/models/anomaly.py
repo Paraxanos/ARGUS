@@ -37,8 +37,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import HeteroData
 
-from argus.models.encoder import EMBEDDING_DIM, HIDDEN_DIM, TemporalHeteroGATEncoder, build_temporal_hetero_data
+from argus.models.encoder import (
+    EMBEDDING_DIM,
+    HEADS,
+    HIDDEN_DIM,
+    TIME2VEC_DIM,
+    TemporalHeteroGATEncoder,
+    build_temporal_hetero_data,
+)
 
 MAX_EPOCHS = 30
 LEARNING_RATE = 0.01
@@ -60,6 +68,18 @@ class AnomalyResult:
     scores: list[AnomalyScore]
     embeddings: dict[str, np.ndarray] = field(default_factory=dict)  # node_type -> (n, embedding_dim)
     node_ids: dict[str, list[str]] = field(default_factory=dict)  # node_type -> ids matching embeddings' rows
+    # Everything fusion/evidence.py's save_encoder_checkpoint needs to persist
+    # the trained encoder for later attention-based evidence extraction — the
+    # SAME trained instance embeddings above came from, no second training
+    # pass. None when there was nothing to train (empty/edgeless graph).
+    encoder: TemporalHeteroGATEncoder | None = None
+    data: HeteroData | None = None
+    edge_types: list[tuple[str, str, str]] = field(default_factory=list)
+    temporal_edge_types: set[tuple[str, str, str]] = field(default_factory=set)
+    hidden_dim: int = HIDDEN_DIM
+    embedding_dim: int = EMBEDDING_DIM
+    heads: int = HEADS
+    time2vec_dim: int = TIME2VEC_DIM
 
 
 class _GraphAutoencoder(nn.Module):
@@ -146,7 +166,17 @@ def train_and_score_anomalies(
             )
 
     embeddings_np = {nt: emb.cpu().numpy() for nt, emb in embeddings.items()}
-    return AnomalyResult(scores=scores, embeddings=embeddings_np, node_ids=node_ids)
+    return AnomalyResult(
+        scores=scores,
+        embeddings=embeddings_np,
+        node_ids=node_ids,
+        encoder=model.encoder,
+        data=data,
+        edge_types=data.edge_types,
+        temporal_edge_types=temporal_edge_types,
+        hidden_dim=hidden_dim,
+        embedding_dim=embedding_dim,
+    )
 
 
 def anomaly_score_rows(scores: list[AnomalyScore]) -> list[dict]:

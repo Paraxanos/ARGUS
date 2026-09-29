@@ -1,15 +1,14 @@
 # ARGUS — SIH26146 / NTRO Bitcoin Transaction Monitoring
 
 Team Doomsbyte. Dev A's classical pipeline plus Dev B's Phase 1 (ER pass 2: GraphSAGE +
-HDBSCAN), Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection), and
-Phase 3 (embedding-similarity pattern detector). Still **not** included:
+HDBSCAN), Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection), Phase
+3 (embedding-similarity pattern detector), and Phase 4 (attention-based evidence extraction +
+rationale-templating engine). Still **not** included:
 
-- Dev B's remaining ML work: attention-based evidence extractor, full rationale-templating
-  engine.
 - The Streamlit **dashboard**.
 
-See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-3; the rest
-of Dev B's are marked TODO, not drafted).
+See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-4; the
+dashboard is marked TODO, not drafted).
 
 ## What this repo does
 
@@ -19,8 +18,9 @@ graph construction → classical entity resolution pass 1 (Union-Find) → node 
 splitting pass 1's clusters) → classical pattern detection (peeling chains, CoinJoin) + a shared
 GAT-v2 encoder feeding both graph-autoencoder anomaly detection and embedding-similarity
 pattern-recall extension → seeded risk propagation over `CO_SPEND` + `SAME_ENTITY` edges
-(Personalized PageRank) → score fusion → `alerts.json`. Everything runs fully offline at
-runtime — see `docs/offline_install.md`.
+(Personalized PageRank) → score fusion with attention-based evidence extraction and a
+templated, human-checkable rationale per alert → `alerts.json`. Everything runs fully offline
+at runtime — see `docs/offline_install.md`.
 
 ## Install
 
@@ -51,11 +51,16 @@ see `docs/WRITEUP.md`'s "Entity resolution pass 2" section for its measured resu
 diagnosed root cause for why it doesn't yet meaningfully improve on pass 1 on this dataset.
 `detect` trains the shared GAT-v2 encoder once (`argus.models.anomaly`) and uses it for both the
 anomaly head and the embedding-similarity pattern detector (`argus.detectors.pattern_sim`, Dev B
-Phase 3 — no second training pass), alongside the classical peeling/CoinJoin/risk detectors —
-see `docs/WRITEUP.md`'s "Anomaly detection" and "Pattern-similarity detection" sections. `fusion`
-is pure score-reading (as it was pre-Phase-2) — all training now happens in `er2` and `detect`
-(~60-100s for `er2`; `detect` ~4-4.5 minutes at this scale, CPU-only, dominated by encoder
-training, not the detectors themselves).
+Phase 3 — no second training pass), alongside the classical peeling/CoinJoin/risk detectors, and
+persists the trained encoder (`data/artifacts/encoder_checkpoint.pt`, ~76 MB) — see
+`docs/WRITEUP.md`'s "Anomaly detection" and "Pattern-similarity detection" sections. `fusion`
+reloads that checkpoint to extract attention-based evidence for the final alert list (Dev B
+Phase 4, `argus.fusion.evidence` + `argus.fusion.rationale` — no third training pass) — see
+"Explainable evidence extraction". All training happens in `er2` and `detect` (~60-100s for
+`er2`; `detect` ~4-4.5 minutes at this scale, CPU-only, dominated by encoder training, not the
+detectors themselves); `fusion` adds ~1.5 minutes for evidence extraction (checkpoint load + one
+attention-capturing forward pass), no longer the sub-10-second pure score-reading it briefly
+was between Phases 2 and 4.
 
 `configs/default.yaml` controls the generated scale and noise/difficulty knobs (`ip_noise`,
 `heuristic_break_rate`, `mixer_fraction`); see `docs/WRITEUP.md`'s "Scale tested" section for
@@ -127,3 +132,9 @@ make test
   adaptive population-relative z-score gate fixed it. See `docs/WRITEUP.md`'s
   "Pattern-similarity detection" section and `docs/contracts.md`'s `scores_pattern.parquet`
   section.
+- **`fusion/evidence.py`'s attention extraction had a real, caught-before-shipping performance
+  bug**: an early version ran a full-graph forward pass per alert, measured to push `fusion`'s
+  runtime for a 15k-wallet test dataset past 9 minutes. Fixed by separating the one-time forward
+  pass (`build_attention_context`) from the per-alert lookup (`extract_attention_evidence`);
+  `fusion` now runs in ~1.5 minutes on the full 200k-tx dataset. See `docs/WRITEUP.md`'s
+  "Explainable evidence extraction" section.

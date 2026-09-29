@@ -12,6 +12,7 @@ import random
 
 import igraph as ig
 import pandas as pd
+import torch
 
 from argus.models.anomaly import anomaly_score_rows, train_and_score_anomalies
 
@@ -101,6 +102,25 @@ def test_result_also_returns_matching_embeddings_for_pattern_sim_reuse():
     assert set(result.embeddings) == set(result.node_ids)
     for node_type, ids in result.node_ids.items():
         assert result.embeddings[node_type].shape == (len(ids), 4)
+
+
+def test_result_also_returns_the_trained_encoder_for_evidence_reuse():
+    """Phase 4's fusion/evidence.py needs the SAME trained encoder + its
+    input graph tensors (no second training pass, matching pattern_sim's
+    embedding reuse in Phase 3) — checked here at the source rather than
+    only indirectly via evidence.py's own tests.
+    """
+    g, node_features = _graph_with_one_outlier_wallet(n_normal=10)
+    result = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=5, seed=0)
+
+    assert result.encoder is not None
+    assert result.data is not None
+    assert result.edge_types == result.data.edge_types
+    with torch.no_grad():
+        out = result.encoder(result.data)
+    assert set(out) == set(result.embeddings)
+    for node_type, emb in result.embeddings.items():
+        assert out[node_type].numpy().shape == emb.shape
 
 
 def test_empty_graph_returns_no_scores_without_crashing():

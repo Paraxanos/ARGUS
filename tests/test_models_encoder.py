@@ -108,6 +108,36 @@ def test_encoder_forward_produces_valid_embeddings_for_every_node_type():
         assert not torch.isnan(out[node_type]).any()
 
 
+def test_forward_with_attention_matches_forward_and_yields_valid_attention():
+    """fusion/evidence.py's attention-based evidence extraction (Phase 4)
+    depends on forward_with_attention reproducing forward()'s embeddings
+    exactly (it must be reading the SAME computation, not an approximation)
+    while additionally exposing per-edge attention weights for every
+    relation at both layers.
+    """
+    g = _toy_graph_with_timestamps()
+    features = _toy_features(g)
+    data, _ = build_temporal_hetero_data(g, features)
+    temporal = {et for et in data.edge_types if et[1] in ("BROADCAST_VIA", "rev_BROADCAST_VIA")}
+
+    model = TemporalHeteroGATEncoder(data.edge_types, temporal, hidden_dim=8, out_dim=4, heads=2, time2vec_dim=6)
+    model.eval()
+    with torch.no_grad():
+        plain_out = model(data)
+        attn_out, attention = model.forward_with_attention(data)
+
+    for node_type in plain_out:
+        assert torch.allclose(plain_out[node_type], attn_out[node_type])
+
+    assert set(attention.keys()) == {1, 2}
+    for layer in (1, 2):
+        assert set(attention[layer].keys()) == set(data.edge_types)
+        for et, (edge_index, alpha) in attention[layer].items():
+            assert edge_index.shape[1] == data[et].edge_index.shape[1]
+            assert alpha.shape == (edge_index.shape[1],)  # averaged across heads to one scalar per edge
+            assert not torch.isnan(alpha).any()
+
+
 def test_gradients_flow_into_time2vec_parameters():
     """If Time2Vec's weight/bias never receive a gradient, the temporal
     signal is silently disconnected from training — this is the one thing

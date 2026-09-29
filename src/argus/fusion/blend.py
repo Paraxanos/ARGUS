@@ -4,9 +4,10 @@ scores_anomaly.parquet is now a real model (argus.models.anomaly's graph
 autoencoder, Dev B Phase 2) — see docs/contracts.md and that module's
 docstring for the training/scoring design.
 
-Rationale strings here are a simple, fixed template built from reason_codes
-(architecture-doc §4.4 style) — NOT the full rationale-templating engine,
-which is Dev B's fusion/rationale.py, out of scope in this repo.
+Rationale/evidence generation is argus.fusion.rationale's job (Dev B Phase
+4's templating engine) — this module builds the raw alert (scores,
+reason_codes) and delegates to it, rather than duplicating that logic
+inline as an earlier version of this file did.
 """
 from __future__ import annotations
 
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+
+from argus.fusion.rationale import build_rationale, extract_evidence
 
 # Fallback fill for a node with no anomaly row at all (shouldn't happen in
 # practice — argus.models.anomaly scores every node in the graph — kept as a
@@ -109,64 +112,23 @@ def compute_final_scores(table: pd.DataFrame, ground_truth_entities: pd.DataFram
     return table, method
 
 
-# z above this is "worth a rationale clause" (~93rd percentile under a
-# normal assumption) — a defensible "notable" bar, not a rigorous
-# significance test. Every alert's components.anomaly score is shown
-# regardless; this only gates whether the RATIONALE TEXT mentions it, so an
-# unremarkable z-score doesn't produce a misleading "flagged as anomalous"
-# sentence for a node that wasn't.
-ANOMALY_NOTABLE_Z = 1.5
-
-
-def _extract_evidence(reason_code: str, evidence: dict) -> tuple[list[str], list[tuple[str, str]]]:
-    if reason_code.startswith("PEEL_CHAIN_HOPS"):
-        wallets = evidence.get("wallets", [])
-        txids = evidence.get("txids", [])
-        return [*wallets, *txids], list(zip(wallets[:-1], wallets[1:]))
-    if reason_code.startswith("COINJOIN_ROUND_N"):
-        txid = evidence["txid"]
-        inputs = evidence.get("input_wallets", [])
-        outputs = evidence.get("output_wallets", [])
-        edges = [(w, txid) for w in inputs] + [(txid, w) for w in outputs]
-        return [txid, *inputs, *outputs], edges
-    if reason_code.startswith("SEED_DIST"):
-        path = evidence.get("path", [])
-        return path, list(zip(path[:-1], path[1:]))
-    if reason_code.startswith("ANOMALY_ZSCORE"):
-        # A reconstruction-error anomaly is a property of the flagged node
-        # itself, not a multi-node structure — nothing to add beyond the
-        # node build_alerts already seeds into its evidence set.
-        return [], []
-    return [], []
-
-
-def _rationale(node_id: str, final_score: float, reason_codes: list[str]) -> str:
-    clauses = []
-    for rc in sorted(set(reason_codes)):
-        if rc.startswith("PEEL_CHAIN_HOPS="):
-            clauses.append(f"part of a peeling chain with {rc.split('=')[1]} hops")
-        elif rc.startswith("COINJOIN_ROUND_N="):
-            clauses.append(f"a participant in a CoinJoin round with {rc.split('=')[1]} participants")
-        elif rc.startswith("SEED_DIST="):
-            n = rc.split("=")[1]
-            clauses.append("a known-illicit seed wallet" if n == "0" else f"{n} hop(s) from a known-illicit seed")
-        elif rc.startswith("ANOMALY_ZSCORE="):
-            z = float(rc.split("=")[1])
-            if z > ANOMALY_NOTABLE_Z:
-                clauses.append(f"a statistical anomaly relative to its population (z-score {z:.2f})")
-        else:
-            clauses.append(rc)
-    body = "; ".join(clauses) if clauses else "no specific structural signal"
-    return f"{node_id} flagged (confidence {final_score:.2f}). {body[0].upper() + body[1:]}."
-
-
 def build_alerts(
     final_table: pd.DataFrame,
     scores_pattern: pd.DataFrame,
     scores_risk: pd.DataFrame,
     scores_anomaly: pd.DataFrame,
     threshold: float,
+    attention_evidence_fn=None,
 ) -> list[dict]:
+    """attention_evidence_fn, when given, is called as
+    attention_evidence_fn(node_id) for every alert and should return an
+    fusion.evidence.AttentionEvidence (or None) — accepted duck-typed here
+    (only .nodes/.edges/.neighbors are used) rather than imported, so this
+    module has no hard dependency on torch/PyG and stays importable/testable
+    without them, matching argus.fusion.rationale's own design choice.
+    Omitted entirely (the default), alerts are built exactly as before
+    Dev B Phase 4 — existing callers/tests need no changes.
+    """
     # scores_pattern/scores_risk only ever cover nodes with real structural
     # signal (thousands of rows) — pre-indexing them in full is cheap.
     reasons_by_node: dict[str, list[tuple[str, dict]]] = {}
@@ -187,14 +149,20 @@ def build_alerts(
         if row.node_id in anomaly_by_node.index:
             a = anomaly_by_node.loc[row.node_id]
             node_reasons.append((a["reason_code"], json.loads(a["evidence_json"])))
-        reason_codes = [rc for rc, _ in node_reasons]
 
         nodes_ev: set[str] = {row.node_id}
         edges_ev: set[tuple[str, str]] = set()
         for rc, ev in node_reasons:
-            ns, es = _extract_evidence(rc, ev)
+            ns, es = extract_evidence(row.node_id, rc, ev)
             nodes_ev.update(ns)
             edges_ev.update(es)
+
+        attention = attention_evidence_fn(row.node_id) if attention_evidence_fn else None
+        attention_neighbors = None
+        if attention is not None and attention.neighbors:
+            nodes_ev.update(attention.nodes)
+            edges_ev.update(attention.edges)
+            attention_neighbors = attention.neighbors
 
         alerts.append(
             {
@@ -203,7 +171,7 @@ def build_alerts(
                 "final_score": float(row.final_score),
                 "components": {"pattern": float(row.pattern), "risk": float(row.risk), "anomaly": float(row.anomaly)},
                 "evidence": {"nodes": sorted(nodes_ev), "edges": sorted(list(e) for e in edges_ev)},
-                "rationale": _rationale(row.node_id, row.final_score, reason_codes),
+                "rationale": build_rationale(row.node_id, row.final_score, node_reasons, attention_neighbors),
             }
         )
     return alerts

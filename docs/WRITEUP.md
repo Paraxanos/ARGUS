@@ -34,12 +34,17 @@ rough scaling estimate for 1M transactions (5x this run):
   GAT-v2 encoder + autoencoder training + pattern-similarity search, all in `detect` as of
   Phase 3's refactor — see "Pattern-similarity detection" for why that training moved out of
   `fusion`) each add roughly 1-1.5 minutes at this scale, measured directly (~60-100s for `er2`;
-  `detect` measured at ~4m25s total, of which the shared-encoder training is the dominant cost —
-  the classical detectors and pattern-similarity search itself are seconds, not minutes;
-  `fusion` is back to sub-10-second pure score-reading, as it was pre-Phase-2). Both trained
-  models run a small number of full-batch epochs over the full ~343k-node graph, not
-  mini-batched, so this is expected to scale roughly linearly with graph size same as the rest
-  of the pipeline. CPU-only throughout — no GPU used or required.
+  `detect` measured at ~4m25s-4m51s total, of which the shared-encoder training is the dominant
+  cost — the classical detectors and pattern-similarity search itself are seconds, not minutes).
+  Both trained models run a small number of full-batch epochs over the full ~343k-node graph,
+  not mini-batched, so this is expected to scale roughly linearly with graph size same as the
+  rest of the pipeline. CPU-only throughout — no GPU used or required.
+- Phase 4 (attention-based evidence extraction) adds `fusion`'s cost back: measured at ~1m32s on
+  the full dataset — `encoder_checkpoint.pt` (~76 MB) load + one attention-capturing forward
+  pass over the full graph + evidence lookups for 2,096 alerts. Still a single-digit-minutes
+  pipeline overall; see "Explainable evidence extraction" for the real performance bug caught
+  and fixed before this number was this small (an earlier version measured over 9 minutes on
+  just the ~15k-wallet test dataset alone, extrapolating to far worse at full scale).
 - This was not run. If asked to attempt 1M transactions, expect to hit the Windows long-path
   `pip install` issue documented in the Phase 1 fresh-clone verification again if working from
   a deeply-nested directory — unrelated to scale, but worth flagging alongside it.
@@ -311,10 +316,10 @@ better* detections is answered by those sections' own measured results, not by t
 2 — `scores_anomaly` from a real model (`models/anomaly.py`, see above; no longer the constant
 0.5 placeholder) via a logistic regression calibrated on `ground_truth/entities.parquet`'s
 labels when enough labeled nodes exist (both paths — calibrated and fixed-weight fallback —
-are implemented and tested). Anomaly reason codes now flow into `build_alerts`'s evidence and
-rationale text too, gated by `ANOMALY_NOTABLE_Z` (z > 1.5) so an unremarkable anomaly score
-doesn't produce a misleading "flagged as anomalous" sentence for a node that wasn't — every
-alert's `components.anomaly` value is still always shown regardless.
+are implemented and tested). Anomaly reason codes flow into evidence and rationale text too,
+gated by `ANOMALY_NOTABLE_Z` (z > 1.5, now living in `fusion/rationale.py` — see below) so an
+unremarkable anomaly score doesn't produce a misleading "flagged as anomalous" sentence for a
+node that wasn't — every alert's `components.anomaly` value is still always shown regardless.
 
 Measured on the full dataset with the real anomaly model wired in: fusion universe 2,877,
 1,997 alerts at the 0.6 threshold, fused scores ranging 0.257-0.9999 (median 0.661) — broadly
@@ -324,6 +329,59 @@ between them contributed by the real (if weak per the section above) anomaly sig
 than every node sharing the exact same anomaly value. The alert threshold (0.6) is unchanged
 from the placeholder era and still sits below the risk/seed cluster for the same reason
 documented then — see `blend.py`'s inline comments for the full reasoning.
+
+## Explainable evidence extraction (Dev B, Phase 4)
+
+Architecture doc sec 4.4: "extract an evidence subgraph: the k-hop neighborhood restricted to
+the top attention-weighted edges." Two new modules, both reusing the shared encoder rather than
+training anything new:
+
+`src/argus/fusion/evidence.py` adds `forward_with_attention` to `models/encoder.py`'s shared
+GAT-v2 encoder — a second, side call to each relation's underlying `GATv2Conv` with
+`return_attention_weights=True` (PyG's `HeteroConv` wrapper does not expose this itself),
+verified directly to reproduce `HeteroConv`'s own per-relation output bit-for-bit. Since the
+encoder is 2 layers, layer 2's attention explains a node's 1-hop neighbors' contribution to its
+final embedding, and layer 1's explains those neighbors' own 2-hop contributions — together, the
+"k-hop neighborhood restricted to top attention-weighted edges" the architecture doc asks for.
+`detectors/cli.py` persists the trained encoder + its input graph (`encoder_checkpoint.pt`,
+~76 MB on the full dataset) right after anomaly training; `fusion/cli.py` reloads it, so
+evidence extraction needs no third training pass and only runs over the final (~2,000-alert)
+list, never the full ~343k-node population.
+
+`src/argus/fusion/rationale.py` replaces `blend.py`'s former inline `_rationale`/
+`_extract_evidence` if/elif chain with a registry: each reason_code prefix maps to an
+(evidence_extractor, clause_renderer) pair, extended with a `PATTERN_SIM_*` entry (Phase 3's
+detector had none before this phase) and an optional attention-neighbor clause naming the
+single highest-weight evidence-subgraph neighbor when `fusion/evidence.py` supplies one.
+`register_template()` is the extensibility point for a future detector's reason_code.
+
+**A real performance bug caught before shipping, same standard as every other finding in this
+document:** the first working version called `encoder.forward_with_attention` — a full pass
+over the *entire* graph — once **per alert**. Measured directly: this turned `fusion`'s runtime
+from ~10 seconds (pure score-reading, pre-Phase-4) into over 9 minutes for the ~15k-wallet test
+dataset alone, and would have been far worse at the full 343k-node scale. Root cause: the
+forward pass is identical for every target node, only the neighbor lookup varies, so computing
+it fresh per node was pure waste. Fixed by splitting the module into
+`build_attention_context` (the expensive part, called ONCE per run) and
+`extract_attention_evidence` (a cheap dict lookup against that context, called once per alert).
+Measured after the fix: `fusion/cli.py` on the full 200k-tx dataset took ~1m32s (encoder
+checkpoint load + one attention-forward-pass + evidence for 2,096 alerts) — a real, honest cost
+of this design (not free), but two orders of magnitude better than the bug it replaced, and
+`tests/test_fusion_evidence.py::test_one_context_serves_multiple_targets_without_recomputation`
+guards against this regressing silently again.
+
+**Measured result (full 200k-tx dataset):** 2,095 of 2,096 alerts (99.95%) now carry a concrete
+attention clause naming a specific neighbor node — e.g. `"the model's own attention weighted
+104.188.132.98 most heavily among 24 evidence-subgraph neighbors (weight 1.00)"`. This is a
+genuine capability increase, most valuable for `ANOMALY_ZSCORE`-only alerts specifically:
+`fusion/rationale.py`'s anomaly evidence extractor deliberately returns no structural evidence
+of its own (see its docstring — a reconstruction-error anomaly is a property of the node
+itself), so before this phase those alerts had nothing beyond the flagged node and a z-score
+number. Mechanism correctness (not exact attention *values*, which are learned and not
+independently hand-verifiable) is tested directly: hop-1 neighbors are real graph neighbors of
+the target and never leak into an unrelated node's neighborhood, hop-2 neighbors always connect
+through a genuine hop-1 node, and no node occupies more than one ranking slot under two
+different relation labels (`tests/test_fusion_evidence.py`, `tests/test_fusion_rationale.py`).
 
 ## Offline / install
 
@@ -345,7 +403,7 @@ actually run and how, and the codebase audit for accidental network calls.
   `models/anomaly.py`'s already-trained shared embeddings (moved that training into
   `detectors/cli.py` this phase so it's available here without a second training pass); see
   "Pattern-similarity detection" above and `docs/contracts.md`.
-- **TODO (Dev B): Attention-based evidence extractor** (`fusion/evidence.py`)
-- **TODO (Dev B): Full rationale-templating engine** (`fusion/rationale.py`) — this repo only
-  ships a simple fixed-template rationale string; see `fusion/blend.py`'s docstring.
+- **DONE (Phase 4): Attention-based evidence extractor** (`fusion/evidence.py`) and **full
+  rationale-templating engine** (`fusion/rationale.py`, replacing `blend.py`'s former inline
+  version entirely) — see "Explainable evidence extraction" above and `docs/contracts.md`.
 - **TODO (Dev B): Streamlit dashboard** (`dashboard/`)

@@ -17,6 +17,7 @@ from argus.detectors.pattern_sim import detect_pattern_similarity, pattern_sim_r
 from argus.detectors.peeling import detect_peeling_chains
 from argus.detectors.risk_ppr import compute_risk_scores, risk_score_rows
 from argus.detectors.scores import coinjoin_round_rows, peeling_chain_rows, write_scores
+from argus.fusion.evidence import save_encoder_checkpoint
 from argus.graph.export import read_graph_pickle
 
 app = typer.Typer()
@@ -36,6 +37,26 @@ def run(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
     # training pass. See argus.models.anomaly's module docstring.
     anomaly_result = train_and_score_anomalies(g, node_features)
     write_scores(anomaly_score_rows(anomaly_result.scores), data_dir / "artifacts" / "scores_anomaly.parquet")
+
+    # Persists the trained encoder (not the full autoencoder — its decoders
+    # are only needed for the scoring already done above) so fusion/cli.py
+    # can extract attention-based evidence (Dev B Phase 4) for the final,
+    # much smaller alert list without a third training pass. A None encoder
+    # means train_and_score_anomalies hit its degenerate-empty-graph branch —
+    # nothing to checkpoint.
+    if anomaly_result.encoder is not None:
+        save_encoder_checkpoint(
+            anomaly_result.encoder,
+            anomaly_result.data,
+            anomaly_result.node_ids,
+            anomaly_result.edge_types,
+            anomaly_result.temporal_edge_types,
+            anomaly_result.hidden_dim,
+            anomaly_result.embedding_dim,
+            data_dir / "artifacts" / "encoder_checkpoint.pt",
+            heads=anomaly_result.heads,
+            time2vec_dim=anomaly_result.time2vec_dim,
+        )
 
     sim_matches = detect_pattern_similarity(chains, rounds, anomaly_result.embeddings, anomaly_result.node_ids)
     sim_rows = pattern_sim_rows(sim_matches)

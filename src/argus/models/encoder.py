@@ -132,3 +132,46 @@ class TemporalHeteroGATEncoder(nn.Module):
         x_dict = self.conv1(data.x_dict, edge_index_dict, edge_attr_dict=edge_attr_dict)
         x_dict = {k: F.elu(v) for k, v in x_dict.items()}
         return self.conv2(x_dict, edge_index_dict, edge_attr_dict=edge_attr_dict)
+
+    def forward_with_attention(
+        self, data: HeteroData
+    ) -> tuple[dict[str, torch.Tensor], dict[int, dict[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]]]]:
+        """Same computation as forward(), plus per-layer, per-relation
+        attention weights (fusion/evidence.py's "top attention-weighted
+        edges" per architecture doc sec 4.4) — a second, side pass calling
+        each relation's underlying GATv2Conv directly with
+        return_attention_weights=True, rather than threading that flag
+        through HeteroConv (which does not expose it). Verified empirically
+        to reproduce HeteroConv's own per-relation output bit-for-bit when
+        called with the same (x_src, x_dst) bipartite input it uses
+        internally — see the Phase 4 commit message for that check. This
+        doubles the encoder's forward-pass cost, but only at evidence-
+        extraction time (a handful of calls for flagged nodes), never during
+        training.
+
+        Returns (embeddings, {1: {relation: (edge_index, attention)}, 2: {...}})
+        — attention is averaged across heads to one scalar weight per edge.
+        """
+        edge_index_dict = {et: data[et].edge_index for et in data.edge_types}
+        edge_attr_dict = self._edge_attr_dict(data)
+
+        def layer_attention(hetero_conv: HeteroConv, x_dict: dict[str, torch.Tensor]) -> dict:
+            attn = {}
+            for et, conv in hetero_conv.convs.items():
+                src_type, _, dst_type = et
+                edge_attr = edge_attr_dict.get(et)
+                kwargs = {"edge_attr": edge_attr} if edge_attr is not None else {}
+                _, (edge_index, alpha) = conv(
+                    (x_dict[src_type], x_dict[dst_type]), edge_index_dict[et], return_attention_weights=True, **kwargs
+                )
+                attn[et] = (edge_index, alpha.mean(dim=-1))
+            return attn
+
+        attn_layer1 = layer_attention(self.conv1, data.x_dict)
+        x_dict = self.conv1(data.x_dict, edge_index_dict, edge_attr_dict=edge_attr_dict)
+        x_dict = {k: F.elu(v) for k, v in x_dict.items()}
+
+        attn_layer2 = layer_attention(self.conv2, x_dict)
+        out_dict = self.conv2(x_dict, edge_index_dict, edge_attr_dict=edge_attr_dict)
+
+        return out_dict, {1: attn_layer1, 2: attn_layer2}
