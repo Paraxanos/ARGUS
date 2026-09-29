@@ -71,14 +71,20 @@ class HeteroSAGE(nn.Module):
         return self.conv2(x_dict, edge_index_dict)
 
 
-def build_hetero_data(g: ig.Graph, node_features: pd.DataFrame) -> tuple[HeteroData, dict[str, list[str]]]:
+def build_hetero_data(
+    g: ig.Graph, node_features: pd.DataFrame
+) -> tuple[HeteroData, dict[str, list[str]], dict[str, list[tuple[str, str]]]]:
     """Builds a PyG HeteroData from the typed igraph + node_features.parquet's
     f_* columns, reused directly as input features (already one row per
     node, uniform schema across types, 0-filled where inapplicable — see
     argus.features.build's fill-strategy docstring).
 
-    Returns the HeteroData plus node_type -> ordered node_id list, needed to
-    map embedding rows back to wallet_id/txid/ip/asn strings afterward.
+    Returns the HeteroData, the node_type -> ordered node_id list (needed to
+    map embedding rows back to wallet_id/txid/ip/asn strings afterward), and
+    the relation -> ordered (source_name, target_name) list used to build
+    each relation's edge_index — exposed so a caller (e.g.
+    argus.models.encoder's temporal edge features) can attach a per-edge
+    attribute in the SAME order as edge_index without re-deriving it.
     """
     f_cols = [c for c in node_features.columns if c.startswith("f_")]
     node_ids: dict[str, list[str]] = {}
@@ -116,7 +122,7 @@ def build_hetero_data(g: ig.Graph, node_features: pd.DataFrame) -> tuple[HeteroD
         dst_idx = [local_index[dst_type][t] for _, t in pairs]
         data[src_type, et, dst_type].edge_index = torch.tensor([src_idx, dst_idx], dtype=torch.long)
 
-    return ToUndirected()(data), node_ids
+    return ToUndirected()(data), node_ids, by_relation
 
 
 def _sample_negative(num_nodes: int, batch_size: int, exclude: torch.Tensor) -> torch.Tensor:
@@ -148,7 +154,7 @@ def train_wallet_embeddings(
     torch.manual_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data, node_ids = build_hetero_data(g, node_features)
+    data, node_ids, _edge_order = build_hetero_data(g, node_features)
     data = data.to(device)
     # Built manually rather than via data.edge_index_dict: that property
     # raises KeyError when the HeteroData has zero edge-store entries of any

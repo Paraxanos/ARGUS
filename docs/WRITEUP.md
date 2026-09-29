@@ -26,10 +26,25 @@ rough scaling estimate for 1M transactions (5x this run):
   backend handles in memory on ordinary hardware, but `node_features.parquet` and
   `graph_edges.parquet` would grow proportionally (a few hundred MB each).
 - The full pipeline (`data` through `fusion`) took 1.5-3.5 minutes wall-clock at 200k
-  transactions on the development machine across several runs; naive linear scaling would put
-  1M transactions at roughly 10-20 minutes, though several stages (ER pass 1's transaction
-  scan, feature engineering's per-wallet grouping) are closer to O(n) than O(n²), so this is
-  a rough upper bound rather than a hard prediction.
+  transactions on the development machine across several Dev-A-only runs; naive linear scaling
+  would put 1M transactions at roughly 10-20 minutes for that portion, though several stages
+  (ER pass 1's transaction scan, feature engineering's per-wallet grouping) are closer to O(n)
+  than O(n²), so this is a rough upper bound rather than a hard prediction.
+- Dev B's Phase 1 (ER pass 2: GraphSAGE training + HDBSCAN, in `er2`) and Phases 2-3 (shared
+  GAT-v2 encoder + autoencoder training + pattern-similarity search, all in `detect` as of
+  Phase 3's refactor — see "Pattern-similarity detection" for why that training moved out of
+  `fusion`) each add roughly 1-1.5 minutes at this scale, measured directly (~60-100s for `er2`;
+  `detect` measured at ~4m25s-4m51s total, of which the shared-encoder training is the dominant
+  cost — the classical detectors and pattern-similarity search itself are seconds, not minutes).
+  Both trained models run a small number of full-batch epochs over the full ~343k-node graph,
+  not mini-batched, so this is expected to scale roughly linearly with graph size same as the
+  rest of the pipeline. CPU-only throughout — no GPU used or required.
+- Phase 4 (attention-based evidence extraction) adds `fusion`'s cost back: measured at ~1m32s on
+  the full dataset — `encoder_checkpoint.pt` (~76 MB) load + one attention-capturing forward
+  pass over the full graph + evidence lookups for 2,096 alerts. Still a single-digit-minutes
+  pipeline overall; see "Explainable evidence extraction" for the real performance bug caught
+  and fixed before this number was this small (an earlier version measured over 9 minutes on
+  just the ~15k-wallet test dataset alone, extrapolating to far worse at full scale).
 - This was not run. If asked to attempt 1M transactions, expect to hit the Windows long-path
   `pip install` issue documented in the Phase 1 fresh-clone verification again if working from
   a deeply-nested directory — unrelated to scale, but worth flagging alongside it.
@@ -139,6 +154,55 @@ propagation, pass 1 alone) to 1,616 scored rows (propagation over 7,846 `SAME_EN
 The propagation machinery is correctly wired and exercised; its output quality on this dataset
 inherits pass 2's diagnosed weakness above, not a separate issue in `risk_ppr.py`.
 
+## Anomaly detection (Dev B, Phase 2)
+
+`src/argus/models/encoder.py` implements the architecture doc's sec 4.3 shared detection core:
+a **Temporal Heterogeneous GAT-v2 encoder** — `HeteroConv` of `GATv2Conv` per relation (same
+per-relation-weights pattern as pass 2's GraphSAGE, but attention instead of mean/sum
+aggregation), with `BROADCAST_VIA` edges additionally carrying a **Time2Vec**-encoded timestamp
+feature (Kazemi & Poole 2019: one learnable linear term + learnable-frequency periodic terms —
+the learnable-frequency property is what makes it Time2Vec rather than a fixed sinusoidal
+positional encoding) that `GATv2Conv`'s attention conditions on via `edge_dim`. This encoder is
+deliberately **shared** — sec 4.3's stated intent is that anomaly/pattern/risk signals reason
+over the same learned representation; `models/anomaly.py` is its first real consumer.
+
+`src/argus/models/anomaly.py` is a graph autoencoder: the shared encoder produces each node's
+embedding, a per-node-type linear decoder reconstructs that node's own (already z-scored)
+input features, and the whole thing trains end-to-end via MSE. Reconstruction error is
+z-scored **within** each node type (a Wallet's error is only meaningful relative to other
+Wallets — IPs/ASNs have different feature semantics entirely) and squashed to [0,1] via
+sigmoid, exactly matching the architecture doc's "reconstruction error z-scored against
+population" wording.
+
+**Mechanism verified correct, independent of real-dataset quality:** a hand-built fixture — 20
+near-identical "normal" wallets plus one wallet with deliberately wild-magnitude features, all
+with otherwise-identical local graph structure (isolating the signal to features, not topology)
+— is scored correctly: the planted outlier gets the single highest anomaly z-score among all
+wallets, by a wide margin (z=4.47 vs. a normal-population range of roughly -0.24 to -0.21;
+`tests/test_models_anomaly.py`). `tests/test_models_encoder.py` separately verifies the shared
+encoder itself: valid non-NaN embeddings for every node type, the Time2Vec edge feature
+correctly attached to both `BROADCAST_VIA` and its `ToUndirected()`-generated reverse relation
+in matching per-edge order, and — the one failure mode that wouldn't show up as a shape or NaN
+error — gradients actually reaching Time2Vec's learnable parameters (confirming the temporal
+signal is genuinely wired into training, not a silently-disconnected branch).
+
+**Measured result on the full 200k-tx dataset (verified, not assumed — same standard as every
+other finding in this document):** AUC-ROC 0.510 / precision@50 0.30 against
+`ground_truth/entities.parquet`'s illicit labels — essentially chance-level overall ranking,
+with modest lift in the very top scores over the population base rate. This is a real,
+diagnosable gap, not a bug: the mechanism is independently proven correct above, so the
+shortfall is what the mechanism is measuring, not whether it works. Unsupervised
+reconstruction-error anomaly detection answers "is this node statistically unusual" — a
+different question from "is this node one of the specific labeled ransomware/darknet/mixer
+entity types," and on this dataset's current `f_*` feature schema those only partially overlap:
+illicit entities aren't necessarily feature-space outliers (several behave in
+ordinary-looking ways by construction), while legitimate high-volume entities like exchanges
+can be structural outliers without being illicit at all. **Not fixed in this phase** — a
+supervised or semi-supervised variant, or features specifically discriminative of the illicit
+campaign types (rather than the current general topological/temporal/cross-layer set), would be
+the concrete next step; see `docs/contracts.md`'s `scores_anomaly.parquet` section for the same
+diagnosis at the point it matters.
+
 ## Classical pattern detection
 
 `src/argus/detectors/peeling.py` walks `FUNDS`/`PAYS` edges to find single-input,
@@ -169,6 +233,52 @@ CoinJoin detection reached perfect scores immediately because it reuses the exac
 check ER pass 1 already uses, and CoinJoin rounds are provably the only transactions in this
 dataset with ≥3 genuinely distinct input wallets.
 
+## Pattern-similarity detection (Dev B, Phase 3)
+
+`src/argus/detectors/pattern_sim.py` implements architecture sec 4.3's Pattern-head recall
+extension: "Embedding-similarity search catches near-variants the hard-coded pattern missed."
+It reuses `models/anomaly.py`'s already-trained shared encoder embeddings directly — no second
+training pass — which required moving that training call from `fusion/cli.py` into
+`detectors/cli.py` (this phase), so the ONE trained instance is available to both the anomaly
+head and this detector in the same run; `fusion/cli.py` is now pure score-reading again, as it
+was before Phase 2. For each of the two pattern types, every confirmed structural detection's
+own wallets/transactions form a reference set; every other node of the same type is scored by
+cosine similarity to its nearest reference embedding (not a centroid — a pattern's members can
+play structurally different roles that an average would blur together).
+
+**A single fixed similarity threshold does not work here — measured, not assumed.** An initial
+flat 0.95 cosine cutoff was tested directly against the full dataset before being shipped:
+142,351 matches out of ~343,360 graph nodes (41%). Root cause, diagnosed by measuring the actual
+candidate-vs-reference similarity distribution per (pattern_type, node_type) pair rather than
+guessing: Wallet-vs-peeling, Wallet-vs-CoinJoin, and Transaction-vs-peeling are all compressed
+(median similarity already ~0.94-0.95 — the same structural-embedding-collapse root cause
+diagnosed in `er/embed_cluster.py`'s Phase 1 finding: most wallets/transactions are
+ordinary-looking single-hop activity, so their embeddings cluster tightly regardless of true
+pattern membership), while Transaction-vs-CoinJoin is genuinely well-separated (median ~0.04,
+only ~0.1% of candidates reach 0.95 — a CoinJoin transaction's many-in/many-out shape really is
+a rare, distinctive local topology). One global cutoff cannot serve both regimes correctly.
+
+**Fix:** an adaptive gate — a candidate must clear an absolute floor (0.95) **and** be a genuine
+statistical outlier *within its own candidate population* (z-score > 3, computed per
+(pattern_type, node_type) pair — exactly `models/anomaly.py`'s own z-scoring methodology, reused
+here on similarity instead of reconstruction error), falling back to the absolute floor alone
+below 30 candidates where population statistics aren't trustworthy. This is the same principle
+as ER pass 2's `max_cluster_size` guard (`docs/WRITEUP.md`'s "Entity resolution pass 2"
+section): don't trust one global constant to mean the same thing regardless of the population
+it's being compared against.
+
+**Measured result with the fix (full dataset):** 102 matches, **all** `PATTERN_SIM_COINJOIN` on
+`Transaction`-type nodes — zero `PATTERN_SIM_PEELING` matches, zero `Wallet`-type matches. This
+is the mechanism working correctly, not underperforming: it found signal exactly where the
+measured similarity distribution said signal exists, and correctly found none where the
+distribution said there wasn't any (the peeling/wallet embedding-collapse limitation already
+diagnosed for ER pass 2 applies here too, for the same underlying reason, and is not
+independently re-solved by this module). `tests/test_detectors_pattern_sim.py` verifies the
+mechanism itself on hand-built cases: a genuine near-duplicate is flagged, an unrelated node is
+not, and — the specific regression this measured finding requires guarding against — a large,
+compressed population where most candidates clear the absolute floor does NOT flood the match
+list.
+
 ## Ablation: dual-layer vs on-chain-only
 
 `src/argus/eval/ablation.py` reruns ER/pattern/risk metrics with `BROADCAST_VIA`/`RESOLVES_TO`
@@ -190,21 +300,88 @@ This is the honest, unadjusted result. Per instruction, the generator and detect
 modified to manufacture a difference. If dual-layer signal is to demonstrate measurable value,
 it needs a detector that actually incorporates it — e.g. a peeling-chain confidence adjustment
 based on IP reuse across hops, or an ER heuristic considering shared broadcast infrastructure
-— which does not exist in this repo as of this write-up.
+— which did not exist in this repo as of the Phase 1 write-up above.
+
+**Scope note (Dev B Phases 1-3):** this ablation covers the CLASSICAL pipeline only (ER pass 1,
+peeling/CoinJoin, risk propagation) — it was never extended to the ML stages, which is a
+separate, deliberate scope boundary, not an oversight. Those stages *do* consume `BROADCAST_VIA`
+(via Time2Vec, `models/encoder.py`) and the cross-layer `f_*` features (as GraphSAGE/GAT-v2
+input) directly — see "Entity resolution pass 2", "Anomaly detection", and
+"Pattern-similarity detection" above. Whether that consumption translates into *measurably
+better* detections is answered by those sections' own measured results, not by this ablation.
 
 ## Score fusion
 
-`src/argus/fusion/blend.py` combines `scores_pattern`, `scores_risk`, and a documented,
-explicitly-labeled placeholder `scores_anomaly` (fixed 0.5 for every node — Dev B's
-`models/anomaly.py` is out of scope; see `docs/contracts.md`) via a logistic regression
-calibrated on `ground_truth/entities.parquet`'s labels when enough labeled nodes exist (both
-paths — calibrated and fixed-weight fallback — are implemented and tested). The resulting
-fused-score distribution is bimodal: pattern-only detections cluster near 0.67, risk-only
-detections (currently just the seed set, per the ER finding above) cluster near 0.9998, with
-nothing between. The alert threshold (0.6) was set below both clusters specifically to avoid
-the wrong prioritization a naively "high" threshold would create — it would keep the trivial
-seed-echo cluster while dropping the real structural detections. See `blend.py`'s inline
-comments for the full reasoning.
+`src/argus/fusion/blend.py` combines `scores_pattern`, `scores_risk`, and — as of Dev B Phase
+2 — `scores_anomaly` from a real model (`models/anomaly.py`, see above; no longer the constant
+0.5 placeholder) via a logistic regression calibrated on `ground_truth/entities.parquet`'s
+labels when enough labeled nodes exist (both paths — calibrated and fixed-weight fallback —
+are implemented and tested). Anomaly reason codes flow into evidence and rationale text too,
+gated by `ANOMALY_NOTABLE_Z` (z > 1.5, now living in `fusion/rationale.py` — see below) so an
+unremarkable anomaly score doesn't produce a misleading "flagged as anomalous" sentence for a
+node that wasn't — every alert's `components.anomaly` value is still always shown regardless.
+
+Measured on the full dataset with the real anomaly model wired in: fusion universe 2,877,
+1,997 alerts at the 0.6 threshold, fused scores ranging 0.257-0.9999 (median 0.661) — broadly
+similar shape to the placeholder-era bimodal distribution (pattern-only detections cluster
+lower, risk/seed detections cluster near-1.0), now with a small amount of continuous spread
+between them contributed by the real (if weak per the section above) anomaly signal, rather
+than every node sharing the exact same anomaly value. The alert threshold (0.6) is unchanged
+from the placeholder era and still sits below the risk/seed cluster for the same reason
+documented then — see `blend.py`'s inline comments for the full reasoning.
+
+## Explainable evidence extraction (Dev B, Phase 4)
+
+Architecture doc sec 4.4: "extract an evidence subgraph: the k-hop neighborhood restricted to
+the top attention-weighted edges." Two new modules, both reusing the shared encoder rather than
+training anything new:
+
+`src/argus/fusion/evidence.py` adds `forward_with_attention` to `models/encoder.py`'s shared
+GAT-v2 encoder — a second, side call to each relation's underlying `GATv2Conv` with
+`return_attention_weights=True` (PyG's `HeteroConv` wrapper does not expose this itself),
+verified directly to reproduce `HeteroConv`'s own per-relation output bit-for-bit. Since the
+encoder is 2 layers, layer 2's attention explains a node's 1-hop neighbors' contribution to its
+final embedding, and layer 1's explains those neighbors' own 2-hop contributions — together, the
+"k-hop neighborhood restricted to top attention-weighted edges" the architecture doc asks for.
+`detectors/cli.py` persists the trained encoder + its input graph (`encoder_checkpoint.pt`,
+~76 MB on the full dataset) right after anomaly training; `fusion/cli.py` reloads it, so
+evidence extraction needs no third training pass and only runs over the final (~2,000-alert)
+list, never the full ~343k-node population.
+
+`src/argus/fusion/rationale.py` replaces `blend.py`'s former inline `_rationale`/
+`_extract_evidence` if/elif chain with a registry: each reason_code prefix maps to an
+(evidence_extractor, clause_renderer) pair, extended with a `PATTERN_SIM_*` entry (Phase 3's
+detector had none before this phase) and an optional attention-neighbor clause naming the
+single highest-weight evidence-subgraph neighbor when `fusion/evidence.py` supplies one.
+`register_template()` is the extensibility point for a future detector's reason_code.
+
+**A real performance bug caught before shipping, same standard as every other finding in this
+document:** the first working version called `encoder.forward_with_attention` — a full pass
+over the *entire* graph — once **per alert**. Measured directly: this turned `fusion`'s runtime
+from ~10 seconds (pure score-reading, pre-Phase-4) into over 9 minutes for the ~15k-wallet test
+dataset alone, and would have been far worse at the full 343k-node scale. Root cause: the
+forward pass is identical for every target node, only the neighbor lookup varies, so computing
+it fresh per node was pure waste. Fixed by splitting the module into
+`build_attention_context` (the expensive part, called ONCE per run) and
+`extract_attention_evidence` (a cheap dict lookup against that context, called once per alert).
+Measured after the fix: `fusion/cli.py` on the full 200k-tx dataset took ~1m32s (encoder
+checkpoint load + one attention-forward-pass + evidence for 2,096 alerts) — a real, honest cost
+of this design (not free), but two orders of magnitude better than the bug it replaced, and
+`tests/test_fusion_evidence.py::test_one_context_serves_multiple_targets_without_recomputation`
+guards against this regressing silently again.
+
+**Measured result (full 200k-tx dataset):** 2,095 of 2,096 alerts (99.95%) now carry a concrete
+attention clause naming a specific neighbor node — e.g. `"the model's own attention weighted
+104.188.132.98 most heavily among 24 evidence-subgraph neighbors (weight 1.00)"`. This is a
+genuine capability increase, most valuable for `ANOMALY_ZSCORE`-only alerts specifically:
+`fusion/rationale.py`'s anomaly evidence extractor deliberately returns no structural evidence
+of its own (see its docstring — a reconstruction-error anomaly is a property of the node
+itself), so before this phase those alerts had nothing beyond the flagged node and a z-score
+number. Mechanism correctness (not exact attention *values*, which are learned and not
+independently hand-verifiable) is tested directly: hop-1 neighbors are real graph neighbors of
+the target and never leak into an unrelated node's neighborhood, hop-2 neighbors always connect
+through a genuine hop-1 node, and no node occupies more than one ranking slot under two
+different relation labels (`tests/test_fusion_evidence.py`, `tests/test_fusion_rationale.py`).
 
 ## Offline / install
 
@@ -217,13 +394,16 @@ actually run and how, and the codebase audit for accidental network calls.
 
 - **DONE (Phase 1): ER pass 2 — GraphSAGE + HDBSCAN embedding-based clustering**
   (`er/embed_cluster.py`, `models/sage.py`) — see "Entity resolution pass 2" above.
-- **TODO (Dev B): Temporal hetero GAT-v2 encoder** (`models/encoder.py`) — note this is a
-  separate model from pass 2's GraphSAGE encoder (architecture doc sec 4.2 vs 4.3): this one
-  feeds the anomaly/pattern/risk detection heads, not entity resolution.
-- **TODO (Dev B): Graph autoencoder anomaly detection** (`models/anomaly.py`) — this repo only
-  ships a documented placeholder; see "Score fusion" above and `docs/contracts.md`.
-- **TODO (Dev B): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`)
-- **TODO (Dev B): Attention-based evidence extractor** (`fusion/evidence.py`)
-- **TODO (Dev B): Full rationale-templating engine** (`fusion/rationale.py`) — this repo only
-  ships a simple fixed-template rationale string; see `fusion/blend.py`'s docstring.
+- **DONE (Phase 2): Temporal hetero GAT-v2 encoder** (`models/encoder.py`) — a separate model
+  from pass 2's GraphSAGE encoder (architecture doc sec 4.2 vs 4.3): this one feeds the
+  anomaly/pattern/risk detection heads, not entity resolution. See "Anomaly detection" above.
+- **DONE (Phase 2): Graph autoencoder anomaly detection** (`models/anomaly.py`) — replaces the
+  former placeholder entirely (deleted); see "Anomaly detection" above and `docs/contracts.md`.
+- **DONE (Phase 3): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`) — reuses
+  `models/anomaly.py`'s already-trained shared embeddings (moved that training into
+  `detectors/cli.py` this phase so it's available here without a second training pass); see
+  "Pattern-similarity detection" above and `docs/contracts.md`.
+- **DONE (Phase 4): Attention-based evidence extractor** (`fusion/evidence.py`) and **full
+  rationale-templating engine** (`fusion/rationale.py`, replacing `blend.py`'s former inline
+  version entirely) — see "Explainable evidence extraction" above and `docs/contracts.md`.
 - **TODO (Dev B): Streamlit dashboard** (`dashboard/`)

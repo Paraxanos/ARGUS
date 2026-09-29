@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from argus.eval.metrics import er_metrics, pattern_metrics, risk_metrics
+from argus.eval.metrics import anomaly_metrics, er_metrics, pattern_metrics, risk_metrics
 from argus.graph.export import read_graph_pickle
 
 
@@ -25,5 +25,13 @@ def run_full_summary(data_dir: Path) -> pd.DataFrame:
     metrics.update(er_metrics(canonical_df, ground_truth_entities))
     metrics.update(pattern_metrics(g, ground_truth_patterns))
     metrics.update(risk_metrics(g, seeds["wallet_id"].tolist(), ground_truth_entities))
+
+    # anomaly_metrics reads the persisted scores_anomaly.parquet rather than
+    # retraining — see its docstring for why this one metric deviates from
+    # this function's otherwise-always-fresh pattern.
+    anomaly_path = data_dir / "artifacts" / "scores_anomaly.parquet"
+    if anomaly_path.exists():
+        scores_anomaly = pd.read_parquet(anomaly_path)
+        metrics.update(anomaly_metrics(scores_anomaly, ground_truth_entities))
 
     return pd.DataFrame([{"metric": k, "value": v} for k, v in metrics.items()])
