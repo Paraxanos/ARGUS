@@ -69,10 +69,10 @@ def test_planted_outlier_scores_highest_among_wallets():
     n_normal = 20
     g, node_features = _graph_with_one_outlier_wallet(n_normal)
 
-    scores = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=60, seed=0)
-    by_id = {s.node_id: s for s in scores}
+    result = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=60, seed=0)
+    by_id = {s.node_id: s for s in result.scores}
 
-    wallet_scores = [s for s in scores if s.node_type == "Wallet"]
+    wallet_scores = [s for s in result.scores if s.node_type == "Wallet"]
     assert by_id["w_outlier"].score == max(s.score for s in wallet_scores)
     normal_z = [by_id[f"w{i}"].z_score for i in range(n_normal)]
     assert by_id["w_outlier"].z_score > max(normal_z)
@@ -80,18 +80,27 @@ def test_planted_outlier_scores_highest_among_wallets():
 
 def test_scores_are_contract_shaped_and_bounded():
     g, node_features = _graph_with_one_outlier_wallet(n_normal=10)
-    scores = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=5, seed=0)
+    result = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=5, seed=0)
 
-    assert scores  # every node type got scored
-    assert all(0.0 <= s.score <= 1.0 for s in scores)
-    node_ids = {s.node_id for s in scores}
+    assert result.scores  # every node type got scored
+    assert all(0.0 <= s.score <= 1.0 for s in result.scores)
+    node_ids = {s.node_id for s in result.scores}
     assert node_ids == set(g.vs["name"])  # full population coverage, no node skipped
 
-    rows = anomaly_score_rows(scores)
+    rows = anomaly_score_rows(result.scores)
     df = pd.DataFrame(rows)
     assert list(df.columns) == ["node_id", "score", "reason_code", "evidence_json"]
     assert df["reason_code"].str.startswith("ANOMALY_ZSCORE=").all()
     assert not df.isna().any().any()
+
+
+def test_result_also_returns_matching_embeddings_for_pattern_sim_reuse():
+    g, node_features = _graph_with_one_outlier_wallet(n_normal=10)
+    result = train_and_score_anomalies(g, node_features, hidden_dim=8, embedding_dim=4, max_epochs=5, seed=0)
+
+    assert set(result.embeddings) == set(result.node_ids)
+    for node_type, ids in result.node_ids.items():
+        assert result.embeddings[node_type].shape == (len(ids), 4)
 
 
 def test_empty_graph_returns_no_scores_without_crashing():
@@ -102,5 +111,5 @@ def test_empty_graph_returns_no_scores_without_crashing():
     g.es["type"] = []
     features = pd.DataFrame({"node_id": ["w0", "w1"], "node_type": ["Wallet", "Wallet"], "f_dummy": [0.0, 1.0]})
 
-    scores = train_and_score_anomalies(g, features, max_epochs=1)
-    assert scores == []
+    result = train_and_score_anomalies(g, features, max_epochs=1)
+    assert result.scores == []

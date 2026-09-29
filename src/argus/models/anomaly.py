@@ -4,7 +4,13 @@
 Shares argus.models.encoder's TemporalHeteroGATEncoder rather than training a
 bespoke model of its own — its first real consumer, and the architecture
 doc's explicit intent (sec 4.3: sharing one encoder "forces anomaly/pattern/
-risk signals to reason over the SAME learned representation").
+risk signals to reason over the SAME learned representation"). This module
+trains the ONE instance of that encoder used pipeline-wide: it returns the
+trained embeddings alongside anomaly scores specifically so
+argus.detectors.pattern_sim (Phase 3, the architecture's other named
+consumer of this shared representation) doesn't need — and cost — a second
+full training pass. See argus.detectors.cli, which calls this once and
+passes the embeddings on.
 
 TRAINING: a standard autoencoder — encode each node, then a per-node-type
 linear decoder reconstructs that node's own input features (already
@@ -23,9 +29,10 @@ score head's contracted range (docs/contracts.md).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import igraph as ig
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -46,6 +53,13 @@ class AnomalyScore:
     raw_error: float
     population_mean_error: float
     population_std_error: float
+
+
+@dataclass
+class AnomalyResult:
+    scores: list[AnomalyScore]
+    embeddings: dict[str, np.ndarray] = field(default_factory=dict)  # node_type -> (n, embedding_dim)
+    node_ids: dict[str, list[str]] = field(default_factory=dict)  # node_type -> ids matching embeddings' rows
 
 
 class _GraphAutoencoder(nn.Module):
@@ -76,7 +90,7 @@ def train_and_score_anomalies(
     max_epochs: int = MAX_EPOCHS,
     lr: float = LEARNING_RATE,
     seed: int = 0,
-) -> list[AnomalyScore]:
+) -> AnomalyResult:
     torch.manual_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -89,7 +103,7 @@ def train_and_score_anomalies(
     if not feature_dims or not data.edge_types:
         # No node types with any nodes, or no edges anywhere (degenerate/
         # empty graph) — nothing to encode or reconstruct.
-        return []
+        return AnomalyResult(scores=[])
 
     model = _GraphAutoencoder(data.edge_types, temporal_edge_types, feature_dims, hidden_dim, embedding_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -105,6 +119,7 @@ def train_and_score_anomalies(
     model.eval()
     with torch.no_grad():
         recon = model(data)
+        embeddings = model.encoder(data)
 
     scores: list[AnomalyScore] = []
     for node_type, ids in node_ids.items():
@@ -129,7 +144,9 @@ def train_and_score_anomalies(
                     population_std_error=float(std),
                 )
             )
-    return scores
+
+    embeddings_np = {nt: emb.cpu().numpy() for nt, emb in embeddings.items()}
+    return AnomalyResult(scores=scores, embeddings=embeddings_np, node_ids=node_ids)
 
 
 def anomaly_score_rows(scores: list[AnomalyScore]) -> list[dict]:

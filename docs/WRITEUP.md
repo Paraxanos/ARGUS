@@ -30,11 +30,16 @@ rough scaling estimate for 1M transactions (5x this run):
   would put 1M transactions at roughly 10-20 minutes for that portion, though several stages
   (ER pass 1's transaction scan, feature engineering's per-wallet grouping) are closer to O(n)
   than O(n²), so this is a rough upper bound rather than a hard prediction.
-- Dev B's Phase 1 (ER pass 2: GraphSAGE training + HDBSCAN) and Phase 2 (anomaly: GAT-v2
-  encoder + autoencoder training) each add roughly 1-1.5 minutes at this scale, measured
-  directly (~60-100s each, CPU-only, no GPU used or required) — both train a small number of
-  full-batch epochs over the full ~343k-node graph, not mini-batched, so this is expected to
-  scale roughly linearly with graph size same as the rest of the pipeline.
+- Dev B's Phase 1 (ER pass 2: GraphSAGE training + HDBSCAN, in `er2`) and Phases 2-3 (shared
+  GAT-v2 encoder + autoencoder training + pattern-similarity search, all in `detect` as of
+  Phase 3's refactor — see "Pattern-similarity detection" for why that training moved out of
+  `fusion`) each add roughly 1-1.5 minutes at this scale, measured directly (~60-100s for `er2`;
+  `detect` measured at ~4m25s total, of which the shared-encoder training is the dominant cost —
+  the classical detectors and pattern-similarity search itself are seconds, not minutes;
+  `fusion` is back to sub-10-second pure score-reading, as it was pre-Phase-2). Both trained
+  models run a small number of full-batch epochs over the full ~343k-node graph, not
+  mini-batched, so this is expected to scale roughly linearly with graph size same as the rest
+  of the pipeline. CPU-only throughout — no GPU used or required.
 - This was not run. If asked to attempt 1M transactions, expect to hit the Windows long-path
   `pip install` issue documented in the Phase 1 fresh-clone verification again if working from
   a deeply-nested directory — unrelated to scale, but worth flagging alongside it.
@@ -223,6 +228,52 @@ CoinJoin detection reached perfect scores immediately because it reuses the exac
 check ER pass 1 already uses, and CoinJoin rounds are provably the only transactions in this
 dataset with ≥3 genuinely distinct input wallets.
 
+## Pattern-similarity detection (Dev B, Phase 3)
+
+`src/argus/detectors/pattern_sim.py` implements architecture sec 4.3's Pattern-head recall
+extension: "Embedding-similarity search catches near-variants the hard-coded pattern missed."
+It reuses `models/anomaly.py`'s already-trained shared encoder embeddings directly — no second
+training pass — which required moving that training call from `fusion/cli.py` into
+`detectors/cli.py` (this phase), so the ONE trained instance is available to both the anomaly
+head and this detector in the same run; `fusion/cli.py` is now pure score-reading again, as it
+was before Phase 2. For each of the two pattern types, every confirmed structural detection's
+own wallets/transactions form a reference set; every other node of the same type is scored by
+cosine similarity to its nearest reference embedding (not a centroid — a pattern's members can
+play structurally different roles that an average would blur together).
+
+**A single fixed similarity threshold does not work here — measured, not assumed.** An initial
+flat 0.95 cosine cutoff was tested directly against the full dataset before being shipped:
+142,351 matches out of ~343,360 graph nodes (41%). Root cause, diagnosed by measuring the actual
+candidate-vs-reference similarity distribution per (pattern_type, node_type) pair rather than
+guessing: Wallet-vs-peeling, Wallet-vs-CoinJoin, and Transaction-vs-peeling are all compressed
+(median similarity already ~0.94-0.95 — the same structural-embedding-collapse root cause
+diagnosed in `er/embed_cluster.py`'s Phase 1 finding: most wallets/transactions are
+ordinary-looking single-hop activity, so their embeddings cluster tightly regardless of true
+pattern membership), while Transaction-vs-CoinJoin is genuinely well-separated (median ~0.04,
+only ~0.1% of candidates reach 0.95 — a CoinJoin transaction's many-in/many-out shape really is
+a rare, distinctive local topology). One global cutoff cannot serve both regimes correctly.
+
+**Fix:** an adaptive gate — a candidate must clear an absolute floor (0.95) **and** be a genuine
+statistical outlier *within its own candidate population* (z-score > 3, computed per
+(pattern_type, node_type) pair — exactly `models/anomaly.py`'s own z-scoring methodology, reused
+here on similarity instead of reconstruction error), falling back to the absolute floor alone
+below 30 candidates where population statistics aren't trustworthy. This is the same principle
+as ER pass 2's `max_cluster_size` guard (`docs/WRITEUP.md`'s "Entity resolution pass 2"
+section): don't trust one global constant to mean the same thing regardless of the population
+it's being compared against.
+
+**Measured result with the fix (full dataset):** 102 matches, **all** `PATTERN_SIM_COINJOIN` on
+`Transaction`-type nodes — zero `PATTERN_SIM_PEELING` matches, zero `Wallet`-type matches. This
+is the mechanism working correctly, not underperforming: it found signal exactly where the
+measured similarity distribution said signal exists, and correctly found none where the
+distribution said there wasn't any (the peeling/wallet embedding-collapse limitation already
+diagnosed for ER pass 2 applies here too, for the same underlying reason, and is not
+independently re-solved by this module). `tests/test_detectors_pattern_sim.py` verifies the
+mechanism itself on hand-built cases: a genuine near-duplicate is flagged, an unrelated node is
+not, and — the specific regression this measured finding requires guarding against — a large,
+compressed population where most candidates clear the absolute floor does NOT flood the match
+list.
+
 ## Ablation: dual-layer vs on-chain-only
 
 `src/argus/eval/ablation.py` reruns ER/pattern/risk metrics with `BROADCAST_VIA`/`RESOLVES_TO`
@@ -244,7 +295,15 @@ This is the honest, unadjusted result. Per instruction, the generator and detect
 modified to manufacture a difference. If dual-layer signal is to demonstrate measurable value,
 it needs a detector that actually incorporates it — e.g. a peeling-chain confidence adjustment
 based on IP reuse across hops, or an ER heuristic considering shared broadcast infrastructure
-— which does not exist in this repo as of this write-up.
+— which did not exist in this repo as of the Phase 1 write-up above.
+
+**Scope note (Dev B Phases 1-3):** this ablation covers the CLASSICAL pipeline only (ER pass 1,
+peeling/CoinJoin, risk propagation) — it was never extended to the ML stages, which is a
+separate, deliberate scope boundary, not an oversight. Those stages *do* consume `BROADCAST_VIA`
+(via Time2Vec, `models/encoder.py`) and the cross-layer `f_*` features (as GraphSAGE/GAT-v2
+input) directly — see "Entity resolution pass 2", "Anomaly detection", and
+"Pattern-similarity detection" above. Whether that consumption translates into *measurably
+better* detections is answered by those sections' own measured results, not by this ablation.
 
 ## Score fusion
 
@@ -282,8 +341,10 @@ actually run and how, and the codebase audit for accidental network calls.
   anomaly/pattern/risk detection heads, not entity resolution. See "Anomaly detection" above.
 - **DONE (Phase 2): Graph autoencoder anomaly detection** (`models/anomaly.py`) — replaces the
   former placeholder entirely (deleted); see "Anomaly detection" above and `docs/contracts.md`.
-- **TODO (Dev B): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`) — the
-  natural next consumer of `models/encoder.py`'s shared embeddings, per architecture sec 4.3.
+- **DONE (Phase 3): Embedding-similarity pattern detector** (`detectors/pattern_sim.py`) — reuses
+  `models/anomaly.py`'s already-trained shared embeddings (moved that training into
+  `detectors/cli.py` this phase so it's available here without a second training pass); see
+  "Pattern-similarity detection" above and `docs/contracts.md`.
 - **TODO (Dev B): Attention-based evidence extractor** (`fusion/evidence.py`)
 - **TODO (Dev B): Full rationale-templating engine** (`fusion/rationale.py`) — this repo only
   ships a simple fixed-template rationale string; see `fusion/blend.py`'s docstring.

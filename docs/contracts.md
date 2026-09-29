@@ -108,12 +108,32 @@ Producer: `features`.
 
 ## `artifacts/scores_pattern.parquet`
 
-Producer: `detectors/peeling.py` + `detectors/coinjoin.py` (classical only).
+Producer: `detectors/peeling.py` + `detectors/coinjoin.py` (classical, structural) and, as of
+Dev B Phase 3, `detectors/pattern_sim.py` (embedding-similarity recall extension) — all three
+append rows to the same artifact (`detectors/scores.py`'s own long-standing docstring), never
+replacing or deduplicating each other's detections.
 
 - `node_id`
-- `score` ∈ [0,1]
-- `reason_code`
+- `score` ∈ [0,1] (pattern_sim: `(cosine_similarity + 1) / 2`, order-preserving)
+- `reason_code` (classical: `PEEL_CHAIN_HOPS=n` / `COINJOIN_ROUND_N=n`; pattern_sim:
+  `PATTERN_SIM_PEELING=<sim>` / `PATTERN_SIM_COINJOIN=<sim>`)
 - `evidence_json`
+
+**pattern_sim measured result (full 200k-tx dataset — verified, not assumed):** 102 additional
+matches, **all** `PATTERN_SIM_COINJOIN` on `Transaction`-type nodes, zero on `Wallet`-type nodes
+and zero `PATTERN_SIM_PEELING` matches of either node type. This is the correct, diagnosed
+outcome, not underperformance: candidate-vs-reference cosine similarity was measured directly
+per (pattern_type, node_type) pair before shipping, and only Transaction-vs-CoinJoin is
+genuinely well-separated (median similarity ~0.04 — a CoinJoin transaction's many-in/many-out
+shape is a rare, distinctive local topology); every other pairing is compressed (median already
+~0.94-0.95), the same root cause diagnosed in `er/embed_cluster.py`'s docstring (most
+wallets/transactions are structurally-ordinary single-hop activity, so their embeddings cluster
+tightly regardless of true pattern membership). See `detectors/pattern_sim.py`'s module
+docstring for the full measurement and the adaptive z-score gate (on top of an absolute
+similarity floor) this finding required — an uncapped flat cosine threshold measured 142,351
+matches out of ~343k nodes (41% of the entire graph) before that fix, the same class of failure
+as ER pass 2's uncapped HDBSCAN run and fixed on the same principle: a candidate must be a
+genuine outlier *relative to its own candidate population*, not just above one global constant.
 
 ## `artifacts/scores_risk.parquet`
 

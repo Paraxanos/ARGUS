@@ -1,32 +1,23 @@
 from __future__ import annotations
 
-# argus.models.anomaly (torch/torch_geometric, transitively via
-# argus.models.encoder) MUST be imported before numpy/pandas/sklearn/igraph
-# in this process — see src/argus/er/cli.py's matching comment and
-# tests/conftest.py for the full explanation (a Windows-only DLL-init crash,
-# bisected during Dev B Phase 1).
-from argus.models.anomaly import anomaly_score_rows, train_and_score_anomalies  # noqa: E402, isort:skip
-
 from pathlib import Path
 
 import pandas as pd
 import typer
 
-from argus.detectors.scores import write_scores
 from argus.fusion.blend import ALERT_THRESHOLD, build_alerts, component_table, compute_final_scores, write_alerts
-from argus.graph.export import read_graph_pickle
 
 app = typer.Typer()
 
 
 @app.command()
 def run(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
-    g = read_graph_pickle(data_dir / "artifacts" / "graph.pkl")
-    node_features = pd.read_parquet(data_dir / "artifacts" / "node_features.parquet")
-
-    anomaly_scores = train_and_score_anomalies(g, node_features)
-    write_scores(anomaly_score_rows(anomaly_scores), data_dir / "artifacts" / "scores_anomaly.parquet")
-
+    # scores_anomaly.parquet is produced by argus.detectors.cli's `run`
+    # (Dev B Phase 2/3: the shared encoder trains there, once, so
+    # detectors/pattern_sim.py's embedding-similarity search can reuse the
+    # same trained embeddings instead of paying for a second training pass —
+    # see argus.models.anomaly's module docstring). This stage is pure
+    # fusion: read the three already-computed score heads, blend, done.
     scores_pattern = pd.read_parquet(data_dir / "artifacts" / "scores_pattern.parquet")
     scores_risk = pd.read_parquet(data_dir / "artifacts" / "scores_risk.parquet")
     scores_anomaly = pd.read_parquet(data_dir / "artifacts" / "scores_anomaly.parquet")

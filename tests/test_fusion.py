@@ -3,6 +3,7 @@ import random
 import pandas as pd
 
 from argus.detectors.coinjoin import detect_coinjoin_rounds
+from argus.detectors.pattern_sim import detect_pattern_similarity, pattern_sim_rows
 from argus.detectors.peeling import detect_peeling_chains
 from argus.detectors.risk_ppr import compute_risk_scores, risk_score_rows
 from argus.detectors.scores import coinjoin_round_rows, peeling_chain_rows
@@ -47,21 +48,23 @@ def _pipeline_outputs(tmp_path, seed: int = 41):
 
     chains = detect_peeling_chains(g)
     rounds = detect_coinjoin_rounds(g)
+
+    empty_resolved_entities = pd.DataFrame(columns=["wallet_id", "entity_id"])
+    node_features = compute_node_features(g, df, empty_resolved_entities)
+    anomaly_result = train_and_score_anomalies(g, node_features, max_epochs=10)
+    scores_anomaly = pd.DataFrame(
+        anomaly_score_rows(anomaly_result.scores), columns=["node_id", "score", "reason_code", "evidence_json"]
+    )
+
+    sim_matches = detect_pattern_similarity(chains, rounds, anomaly_result.embeddings, anomaly_result.node_ids)
     scores_pattern = pd.DataFrame(
-        peeling_chain_rows(chains) + coinjoin_round_rows(rounds),
+        peeling_chain_rows(chains) + coinjoin_round_rows(rounds) + pattern_sim_rows(sim_matches),
         columns=["node_id", "score", "reason_code", "evidence_json"],
     )
 
     risk_scores = compute_risk_scores(g, seed_wallets)
     scores_risk = pd.DataFrame(
         risk_score_rows(risk_scores), columns=["node_id", "score", "reason_code", "evidence_json"]
-    )
-
-    empty_resolved_entities = pd.DataFrame(columns=["wallet_id", "entity_id"])
-    node_features = compute_node_features(g, df, empty_resolved_entities)
-    anomaly_scores = train_and_score_anomalies(g, node_features, max_epochs=10)
-    scores_anomaly = pd.DataFrame(
-        anomaly_score_rows(anomaly_scores), columns=["node_id", "score", "reason_code", "evidence_json"]
     )
 
     ground_truth_entities_path = tmp_path / "gt_entities.parquet"

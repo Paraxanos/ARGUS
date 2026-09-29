@@ -1,14 +1,14 @@
 # ARGUS — SIH26146 / NTRO Bitcoin Transaction Monitoring
 
 Team Doomsbyte. Dev A's classical pipeline plus Dev B's Phase 1 (ER pass 2: GraphSAGE +
-HDBSCAN) and Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection).
-Still **not** included:
+HDBSCAN), Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection), and
+Phase 3 (embedding-similarity pattern detector). Still **not** included:
 
-- Dev B's remaining ML work: embedding-similarity pattern detector, attention-based evidence
-  extractor, full rationale-templating engine.
+- Dev B's remaining ML work: attention-based evidence extractor, full rationale-templating
+  engine.
 - The Streamlit **dashboard**.
 
-See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-2; the rest
+See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-3; the rest
 of Dev B's are marked TODO, not drafted).
 
 ## What this repo does
@@ -16,11 +16,11 @@ of Dev B's are marked TODO, not drafted).
 Synthetic Bitcoin transaction data generation → ingestion (CSV/JSON/XML) → typed dual-layer
 graph construction → classical entity resolution pass 1 (Union-Find) → node feature engineering
 → entity resolution pass 2 (heterogeneous GraphSAGE embeddings + HDBSCAN clustering, merging or
-splitting pass 1's clusters) → classical pattern detection (peeling chains, CoinJoin) → seeded
-risk propagation over `CO_SPEND` + `SAME_ENTITY` edges (Personalized PageRank) → graph
-autoencoder anomaly detection (shared temporal GAT-v2 encoder + per-node-type reconstruction) →
-score fusion → `alerts.json`. Everything runs fully offline at runtime — see
-`docs/offline_install.md`.
+splitting pass 1's clusters) → classical pattern detection (peeling chains, CoinJoin) + a shared
+GAT-v2 encoder feeding both graph-autoencoder anomaly detection and embedding-similarity
+pattern-recall extension → seeded risk propagation over `CO_SPEND` + `SAME_ENTITY` edges
+(Personalized PageRank) → score fusion → `alerts.json`. Everything runs fully offline at
+runtime — see `docs/offline_install.md`.
 
 ## Install
 
@@ -49,10 +49,13 @@ Runs the full chain: `data → ingest → graph → er → features → er2 → 
 2 (`argus.er.cli embed`): GraphSAGE + HDBSCAN, reconciled against pass 1's `entities.parquet` —
 see `docs/WRITEUP.md`'s "Entity resolution pass 2" section for its measured result and a
 diagnosed root cause for why it doesn't yet meaningfully improve on pass 1 on this dataset.
-`fusion` also trains and scores the graph-autoencoder anomaly head (`argus.models.anomaly`,
-Dev B Phase 2) before combining all three score heads — see `docs/WRITEUP.md`'s "Anomaly
-detection" section. Both `er2` and `fusion` train a small GNN (~60-100s each at this scale,
-CPU-only) — the pipeline is no longer purely classical/instant past `features`.
+`detect` trains the shared GAT-v2 encoder once (`argus.models.anomaly`) and uses it for both the
+anomaly head and the embedding-similarity pattern detector (`argus.detectors.pattern_sim`, Dev B
+Phase 3 — no second training pass), alongside the classical peeling/CoinJoin/risk detectors —
+see `docs/WRITEUP.md`'s "Anomaly detection" and "Pattern-similarity detection" sections. `fusion`
+is pure score-reading (as it was pre-Phase-2) — all training now happens in `er2` and `detect`
+(~60-100s for `er2`; `detect` ~4-4.5 minutes at this scale, CPU-only, dominated by encoder
+training, not the detectors themselves).
 
 `configs/default.yaml` controls the generated scale and noise/difficulty knobs (`ip_noise`,
 `heuristic_break_rate`, `mixer_fraction`); see `docs/WRITEUP.md`'s "Scale tested" section for
@@ -115,3 +118,12 @@ make test
   illicit-entity-type labels**, a diagnosed gap between "statistically unusual" and "one of the
   labeled illicit types," not a bug. See `docs/WRITEUP.md`'s "Anomaly detection" section and
   `docs/contracts.md`'s `scores_anomaly.parquet` section.
+- **The pattern-similarity detector (`detectors/pattern_sim.py`) only finds signal for
+  CoinJoin-transaction near-variants, not peeling chains or wallet-level near-variants** — the
+  same diagnosed embedding-collapse limitation as ER pass 2 and the anomaly head (most
+  wallets/transactions are structurally ordinary, so embeddings can't discriminate); measured,
+  not assumed, via the actual similarity distribution per pattern/node-type pairing before
+  shipping. An uncapped flat threshold measured a 41%-of-graph false-positive flood before an
+  adaptive population-relative z-score gate fixed it. See `docs/WRITEUP.md`'s
+  "Pattern-similarity detection" section and `docs/contracts.md`'s `scores_pattern.parquet`
+  section.
