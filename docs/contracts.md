@@ -223,6 +223,10 @@ deliberately returns no multi-node evidence of its own (a reconstruction-error a
 property of the node itself), so before Phase 4 those alerts had NO structural evidence beyond
 the flagged node — attention-based extraction is what fills that specific gap.
 
+**Consumer (Dev B Phase 5):** `dashboard/app.py` reads this file plus `node_features.parquet`
+(for graph node-type coloring) — read-only, produces no artifact of its own, so no new contract
+section is needed here.
+
 ## Hard rule
 
 Every head must emit `reason_code` + `evidence_json` — no exceptions, no retrofitting later. This
