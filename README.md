@@ -2,13 +2,11 @@
 
 Team Doomsbyte. Dev A's classical pipeline plus Dev B's Phase 1 (ER pass 2: GraphSAGE +
 HDBSCAN), Phase 2 (shared temporal GAT-v2 encoder + graph autoencoder anomaly detection), Phase
-3 (embedding-similarity pattern detector), and Phase 4 (attention-based evidence extraction +
-rationale-templating engine). Still **not** included:
+3 (embedding-similarity pattern detector), Phase 4 (attention-based evidence extraction +
+rationale-templating engine), and Phase 5 (Streamlit dashboard). All Dev B phases from the
+project plan are now complete.
 
-- The Streamlit **dashboard**.
-
-See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-4; the
-dashboard is marked TODO, not drafted).
+See `docs/WRITEUP.md` for the full write-up (Dev A's sections plus Dev B's Phases 1-5).
 
 ## What this repo does
 
@@ -94,6 +92,21 @@ on-chain-only ablation (swept across `ip_noise`), saving `docs/ablation_results.
 `docs/ablation_plot.png`. See `docs/WRITEUP.md` for the actual numbers and their
 interpretation — including an honest negative result on the ablation (see below).
 
+## Running the dashboard
+
+```
+make dashboard
+```
+
+Opens the read-only Streamlit dashboard (`src/argus/dashboard/app.py`) over the pipeline's
+already-computed `data/artifacts/alerts.json`: a ranked, filterable alert table plus an
+interactive pyvis link-analysis view of each alert's evidence subgraph. It never re-runs any
+pipeline stage — run `make pipeline` first, or `make demo` to run both in sequence. Point it at
+a different run with `ARGUS_DATA_DIR=<path> make dashboard`. Fully offline: pyvis's HTML output
+is generated with `cdn_resources="in_line"` plus a verified post-generation strip of the two
+Bootstrap CDN tags its template still hardcodes in that mode — see `docs/WRITEUP.md`'s
+"Dashboard" section.
+
 ## Tests
 
 ```
@@ -138,3 +151,16 @@ make test
   pass (`build_attention_context`) from the per-alert lookup (`extract_attention_evidence`);
   `fusion` now runs in ~1.5 minutes on the full 200k-tx dataset. See `docs/WRITEUP.md`'s
   "Explainable evidence extraction" section.
+- **pyvis's `cdn_resources="local"`/`"in_line"` modes both still reference at least one external
+  CDN** — verified directly against the installed pyvis version's own HTML template, not
+  assumed. The dashboard works around this with a post-generation strip plus a self-verifying
+  assertion that no `http(s)://` resource reference survives. The dashboard's own UI was
+  verified via a direct `main()` call and an HTTP 200 from the running server, not visually in a
+  browser — no browser-automation harness was available in this environment. See
+  `docs/WRITEUP.md`'s "Dashboard" section.
+- **`streamlit run` blocks on an interactive email prompt and calls out to a telemetry endpoint
+  on a machine with no pre-existing `~/.streamlit/credentials.toml`** — a real bug caught by
+  reading Streamlit's own source, not assumed, since this dev machine's own prior Streamlit use
+  masked it locally. Fixed: `make dashboard` now passes `--server.headless=true
+  --browser.gatherUsageStats=false`, verified against a scratch fake-`HOME` with no `.streamlit`
+  directory at all. See `docs/WRITEUP.md`'s "Dashboard" section.

@@ -24,3 +24,11 @@ torch==2.14.0
 torch_geometric==2.8.0.post1
 # scikit-learn's own HDBSCAN (sklearn.cluster.HDBSCAN, available since 1.3)
 # is used for pass 2's clustering — no separate `hdbscan` package needed.
+
+# Dev B Phase 5: Streamlit dashboard (src/argus/dashboard/app.py). pyvis's
+# HTML output is verified offline-safe with cdn_resources="in_line" plus one
+# post-generation strip of two hardcoded Bootstrap CDN tags its template
+# still emits even in "in_line" mode — see the dashboard module's own
+# docstring for the direct verification (not assumed).
+streamlit==1.64.0
+pyvis==0.3.2

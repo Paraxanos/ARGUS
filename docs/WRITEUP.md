@@ -383,6 +383,60 @@ the target and never leak into an unrelated node's neighborhood, hop-2 neighbors
 through a genuine hop-1 node, and no node occupies more than one ranking slot under two
 different relation labels (`tests/test_fusion_evidence.py`, `tests/test_fusion_rationale.py`).
 
+## Dashboard (Dev B, Phase 5)
+
+Architecture doc sec 4.5: "ranked alert table... + pyvis/streamlit-agraph link-analysis graph
+view that highlights the evidence subgraph on click." `src/argus/dashboard/app.py` is a single
+Streamlit file, read-only over `data/artifacts/alerts.json` and `node_features.parquet` — it
+never re-runs any pipeline stage. `make dashboard` runs it standalone; `make demo` runs the full
+pipeline first, matching every other stage's offline/single-process design.
+
+**Offline verification, not assumed — same standard as `docs/offline_install.md`:** pyvis's
+documented `cdn_resources="local"` default was tested directly (generate HTML, search for
+`https?://`) and still emits `cdnjs.cloudflare.com` (vis-network) and `cdn.jsdelivr.net`
+(Bootstrap) URLs despite the name — confirmed by reading the installed pyvis version's own
+`templates/template.html`: the `local` branch only localizes `tom-select`, not vis-network
+itself. Switching to `cdn_resources="in_line"` correctly inlines vis-network, but the same
+template still hardcodes the two Bootstrap CDN tags **unconditionally**, outside every
+`{% if cdn_resources==... %}` branch — a real template limitation, not a misconfiguration here.
+Bootstrap there is decorative page chrome around the graph container, not load-bearing for
+vis-network, so `_strip_external_cdn_links` regex-strips those two tags post-generation and
+asserts no `http(s)://` reference survives (`tests/test_dashboard.py`), rather than trusting
+either parameter name at face value.
+
+**Verified against the real pipeline output**, since no browser-automation harness is available
+in this environment: `main()` invoked directly as a plain Python call against the full-scale
+dataset (2,096 alerts, 343,360 node-type entries) raised no exception, and `curl` against the
+running `streamlit run` server returned HTTP 200. Every non-Streamlit-specific helper
+(`load_alerts`, `load_node_types`, `_alerts_dataframe`, `_strip_external_cdn_links`,
+`render_evidence_graph`) has a direct unit test in `tests/test_dashboard.py`.
+
+**A second real bug caught before shipping, found by reading Streamlit's own source rather than
+assuming `streamlit run` is side-effect-free:** `streamlit.runtime.credentials.check_credentials`
+(called on every `streamlit run`) calls `Credentials.get_current()._check_activated()` whenever
+`server.headless` is `False` (its default on Windows, and on Linux with a `DISPLAY` set) —
+which, on any machine with no pre-existing `~/.streamlit/credentials.toml`, drops into an
+interactive `click.prompt(...)` asking for an email address and blocks on stdin. Separately,
+`browser.gatherUsageStats` defaults to `True` and gates both a startup `GET
+https://data.streamlit.io/metrics.json` call and ongoing per-session telemetry
+(`runtime/metrics_util.py`). Both would silently break this repo's single-command/offline-runtime
+guarantees on a genuinely fresh machine — this dev machine's own pre-existing
+`~/.streamlit/credentials.toml` (unrelated prior local Streamlit use) masked the first issue
+during initial testing, which is exactly why it needed tracing through source rather than trusting
+one successful local run. Fixed by adding `--server.headless=true
+--browser.gatherUsageStats=false` to the Makefile's `dashboard` target — both flags verified
+directly: launched with a scratch, empty fake-`HOME` (no `.streamlit` directory at all,
+simulating a fresh machine) and `timeout`, the server answered HTTP 200 immediately with no
+stdin block, and no `.streamlit` directory was created at all afterward (proving neither the
+activation prompt nor the telemetry file write fired).
+
+Two Streamlit deprecation warnings were found and triaged: `st.dataframe(...,
+use_container_width=True)` was renamed to `width="stretch"`. `st.components.v1.html(...)`'s
+suggested replacement, `st.iframe(...)`, only accepts a `src: str | Path` (confirmed via
+`inspect.signature`) — not raw HTML content — so it is not a valid drop-in replacement here;
+`components.html()` was kept deliberately (still fully functional, only a warning), documented
+inline in `app.py`.
+
 ## Offline / install
 
 See `docs/offline_install.md` for the offline-runtime verification procedure, what was
@@ -406,4 +460,5 @@ actually run and how, and the codebase audit for accidental network calls.
 - **DONE (Phase 4): Attention-based evidence extractor** (`fusion/evidence.py`) and **full
   rationale-templating engine** (`fusion/rationale.py`, replacing `blend.py`'s former inline
   version entirely) — see "Explainable evidence extraction" above and `docs/contracts.md`.
-- **TODO (Dev B): Streamlit dashboard** (`dashboard/`)
+- **DONE (Phase 5): Streamlit dashboard** (`dashboard/app.py`) — ranked alert table + pyvis
+  evidence-subgraph graph view; see "Dashboard" above and `docs/contracts.md`.
