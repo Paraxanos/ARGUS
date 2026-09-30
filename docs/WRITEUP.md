@@ -665,6 +665,8 @@ actually run and how, and the codebase audit for accidental network calls.
 `FALLBACK_WEIGHTS` + `ALERT_THRESHOLD=0.6`, which raised 2–4 alerts, all wrong, on every dataset window tested.
 The changes below make every stage work without labels, and every choice was made on held-out dev data.
 
+**Data.** ARGUS dataset builder and download: https://github.com/Husaam1105/argus_dataset (the README links `data.zip` and explains which release is dev, sealed test and fresh check; `tools/export_to_argus_prototype.py` converts a release into this repo's data-dir layout and `tools/eval_argus_run.py` scores a run).
+
 **Protocol.** Two dev windows (ARGUS dataset, 23 Sep 2026 00–06 and 06–12 UTC) for all design choices; a sealed test
 (24 Sep 00–06) run once at the end; then a fresh window (24 Sep 12–18) that nobody had looked at, whose injected
 crime flows share nothing with any earlier set. Seeds are excluded from every hit count.
