@@ -71,3 +71,36 @@ def test_rejects_match_injected_corruption(tmp_path):
     rejected_txids = {r["txid"] for r in rejected}
     assert valid_txids.isdisjoint(rejected_txids)
     assert len(df) + len(rejected) == len(rows)
+
+
+def test_real_shaped_ip_outside_synthetic_pool_is_rejected_not_crashed(tmp_path):
+    """Real-data finding (ARGUS dataset Track M benchmarking report,
+    2026-09-30): a real-shaped IPv4 address (this generator's synthetic pool
+    never produces one) used to crash the entire ingest run with an
+    uncaught ValueError. It must now be rejected to rejects.log like any
+    other bad row, and every OTHER row must still ingest normally.
+    """
+    # generate_transactions directly, skipping inject_corruption: isolates
+    # the geoip reject path from the unrelated bad-checksum/negative-amount/
+    # bad-timestamp corruption paths, which could otherwise coincidentally
+    # also touch row 0 and break this test's "exactly 1 reject" assumption.
+    cfg = SynthConfig(
+        random_seed=7, num_entities=20, num_wallets=100, num_transactions=50,
+        ip_noise=0.1, heuristic_break_rate=0.1, mixer_fraction=0.02,
+    )
+    rng = random.Random(cfg.random_seed)
+    entities = generate_entities(cfg, rng)
+    wallets = generate_wallets(cfg, rng, entities)
+    rows = generate_transactions(cfg, rng, entities, wallets)
+    rows[0] = dict(rows[0], src_ip="240.1.2.3")  # real-shaped, outside NETWORK_POOL
+    path = tmp_path / "transactions.csv"
+    write_csv(rows, path)
+    rejects_path = tmp_path / "rejects.log"
+
+    df = run_ingest(path, "csv", rejects_path)
+
+    rejected = [json.loads(line) for line in open(rejects_path, encoding="utf-8")]
+    geoip_rejects = [r for r in rejected if r["reason"] == "unresolvable_geoip"]
+    assert len(geoip_rejects) == 1
+    assert geoip_rejects[0]["txid"] == rows[0]["txid"]
+    assert rows[0]["txid"] not in set(df["txid"])

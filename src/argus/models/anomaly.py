@@ -80,6 +80,7 @@ class AnomalyResult:
     embedding_dim: int = EMBEDDING_DIM
     heads: int = HEADS
     time2vec_dim: int = TIME2VEC_DIM
+    losses: list[float] = field(default_factory=list)  # one per training epoch — see argus.models.sage's own TrainingResult.losses
 
 
 class _GraphAutoencoder(nn.Module):
@@ -128,6 +129,7 @@ def train_and_score_anomalies(
     model = _GraphAutoencoder(data.edge_types, temporal_edge_types, feature_dims, hidden_dim, embedding_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    losses: list[float] = []
     for _epoch in range(max_epochs):
         model.train()
         optimizer.zero_grad()
@@ -135,6 +137,7 @@ def train_and_score_anomalies(
         loss = sum(F.mse_loss(recon[nt], data[nt].x) for nt in recon)
         loss.backward()
         optimizer.step()
+        losses.append(float(loss.item()))
 
     model.eval()
     with torch.no_grad():
@@ -176,6 +179,7 @@ def train_and_score_anomalies(
         temporal_edge_types=temporal_edge_types,
         hidden_dim=hidden_dim,
         embedding_dim=embedding_dim,
+        losses=losses,
     )
 
 

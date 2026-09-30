@@ -17,7 +17,14 @@ from pathlib import Path
 import pandas as pd
 import typer
 
-from argus.er.embed_cluster import add_same_entity_edges, reconcile_with_pass1, run_hdbscan, write_pass2_outputs
+from argus.er.embed_cluster import (
+    add_same_entity_edges,
+    drop_high_fanin_broadcasters,
+    reconcile_with_pass1,
+    run_hdbscan,
+    run_with_big_stack,
+    write_pass2_outputs,
+)
 from argus.er.evaluate import evaluate_pairwise
 from argus.er.union_find import add_co_spend_edges, resolve_entities, write_entities_parquet
 from argus.graph.export import export_edges, read_graph_pickle, write_graph_pickle
@@ -58,6 +65,24 @@ def embed(
     min_cluster_size: int = typer.Option(3, "--min-cluster-size"),
     max_epochs: int = typer.Option(30, "--max-epochs"),
     seed: int = typer.Option(0, "--seed"),
+    protect_cospend_clusters: bool = typer.Option(
+        False, "--protect-cospend-clusters",
+        help="Never let pass 2 split a pass-1 entity with >1 wallet. Real-data guard (see "
+             "docs/WRITEUP.md's benchmarking findings) — turn on only once pass 1's own precision "
+             "is independently confirmed high on this dataset; leave off for this repo's own "
+             "synthetic data, where pass 1 is diagnosed as vacuous (0 co-spend links).",
+    ),
+    min_merge_probability: float = typer.Option(
+        0.0, "--min-merge-probability",
+        help="Skip a pass-2 merge unless every wallet in the triggering hdbscan cluster has "
+             "hdbscan_prob at or above this floor. 0.0 preserves existing behavior exactly.",
+    ),
+    drop_broadcaster_outliers: bool = typer.Option(
+        False, "--drop-broadcaster-outliers",
+        help="Drop BROADCAST_VIA edges into population-outlier-fan-in IP nodes (e.g. a shared "
+             "light-wallet server) before embedding training only — real-data over-merge guard, "
+             "inert no-op on this repo's own synthetic data.",
+    ),
 ) -> None:
     """ER pass 2: heterogeneous GraphSAGE wallet embeddings (argus.models.sage)
     + HDBSCAN clustering, reconciled against pass 1's entities.parquet (merge
@@ -71,11 +96,20 @@ def embed(
     node_features = pd.read_parquet(data_dir / "artifacts" / "node_features.parquet")
     pass1_entities = pd.read_parquet(data_dir / "artifacts" / "entities.parquet")
 
-    training = train_wallet_embeddings(g, node_features, max_epochs=max_epochs, seed=seed)
+    g_for_embedding = drop_high_fanin_broadcasters(g) if drop_broadcaster_outliers else g
+    training = train_wallet_embeddings(g_for_embedding, node_features, max_epochs=max_epochs, seed=seed)
     wallet_embeddings = wallet_embeddings_frame(training)
 
-    hdbscan_df = run_hdbscan(wallet_embeddings, min_cluster_size=min_cluster_size)
-    result = reconcile_with_pass1(pass1_entities, hdbscan_df)
+    # Real-data guard (see argus.er.embed_cluster.run_with_big_stack's own
+    # docstring): always on, not opt-in like the guards above -- it changes
+    # nothing about the result, only where HDBSCAN.fit's C-level recursion
+    # runs, so there's no behavior to preserve-by-default for.
+    hdbscan_df = run_with_big_stack(lambda: run_hdbscan(wallet_embeddings, min_cluster_size=min_cluster_size))
+    result = reconcile_with_pass1(
+        pass1_entities, hdbscan_df,
+        protect_multiwallet_pass1_entities=protect_cospend_clusters,
+        min_merge_probability=min_merge_probability,
+    )
 
     entities_path = data_dir / "artifacts" / "entities.parquet"
     log_path = data_dir / "artifacts" / "er_pass2_log.parquet"

@@ -51,8 +51,25 @@ FALLBACK_WEIGHTS = {"pattern": 0.5, "risk": 0.4, "anomaly": 0.1}
 # by construction (component_table only considers nodes with SOME signal).
 ALERT_THRESHOLD = 0.6
 
+# Real-data finding (ARGUS dataset Track M report, 2026-09-30): at a realistic
+# ~0.2% illicit prevalence, ALERT_THRESHOLD=0.6 alone passes ~78% of the
+# scored universe (31,059 of 40,016 nodes) — the threshold's own calibration
+# comment above only holds at the synthetic dataset's much higher prevalence.
+# top_k in build_alerts() below is the fix: a ranked queue caps investigator
+# load regardless of how many nodes clear the threshold, instead of relying
+# on the threshold alone to do that job. 500 matches the report's own
+# "done when" bar (queue of <= 500 alerts, precision@100 >= 0.5) — still
+# advisory here since we can't measure precision@100 without the hidden
+# dataset; the benchmarking team's re-run is the real check.
+DEFAULT_TOP_K = 500
 
-def component_table(scores_pattern: pd.DataFrame, scores_risk: pd.DataFrame, scores_anomaly: pd.DataFrame) -> pd.DataFrame:
+
+def component_table(
+    scores_pattern: pd.DataFrame,
+    scores_risk: pd.DataFrame,
+    scores_anomaly: pd.DataFrame,
+    anomaly_admission_threshold: float | None = None,
+) -> pd.DataFrame:
     """One row per node with ANY pattern or risk signal. Anomaly alone is
     never a reason to consider a node — every one of the graph's ~340k
     nodes gets an anomaly score (argus.models.anomaly scores the full
@@ -60,10 +77,22 @@ def component_table(scores_pattern: pd.DataFrame, scores_risk: pd.DataFrame, sco
     ~340k trivial rows; it only ever narrows or ranks within the
     pattern/risk-flagged set, matching the pre-Phase-2 placeholder's
     behavior exactly (same fusion universe either way).
+
+    anomaly_admission_threshold, when given, ADDITIONALLY admits any node
+    whose anomaly score alone exceeds this cutoff. Real-data finding (ARGUS
+    dataset Track M benchmarking report, 2026-09-30): with only 17 real
+    seeds, risk propagation and pattern hits together covered just 14.7% of
+    illicit targets — this widens the universe without touching the
+    pattern/risk heads themselves. None (default) preserves the exact
+    pre-existing universe, so every existing caller/test is unaffected.
     """
     pattern_max = scores_pattern.groupby("node_id")["score"].max().rename("pattern")
     risk_max = scores_risk.groupby("node_id")["score"].max().rename("risk")
     universe = pattern_max.index.union(risk_max.index)
+
+    if anomaly_admission_threshold is not None:
+        admitted = scores_anomaly.loc[scores_anomaly["score"] > anomaly_admission_threshold, "node_id"]
+        universe = universe.union(pd.Index(admitted))
 
     anomaly_by_node = scores_anomaly.set_index("node_id")["score"]  # exactly one row per node, by construction
 
@@ -119,6 +148,7 @@ def build_alerts(
     scores_anomaly: pd.DataFrame,
     threshold: float,
     attention_evidence_fn=None,
+    top_k: int | None = None,
 ) -> list[dict]:
     """attention_evidence_fn, when given, is called as
     attention_evidence_fn(node_id) for every alert and should return an
@@ -128,6 +158,13 @@ def build_alerts(
     without them, matching argus.fusion.rationale's own design choice.
     Omitted entirely (the default), alerts are built exactly as before
     Dev B Phase 4 — existing callers/tests need no changes.
+
+    top_k, when given, caps the alert queue at the top_k highest-scoring
+    nodes clearing `threshold` — `threshold` stays a floor, not the sole
+    gate. This is the real-data fix for a flooded alert list at low illicit
+    prevalence (see DEFAULT_TOP_K's comment above): a fixed score threshold
+    alone doesn't bound queue size the way an investigator-facing queue
+    needs it to.
     """
     # scores_pattern/scores_risk only ever cover nodes with real structural
     # signal (thousands of rows) — pre-indexing them in full is cheap.
@@ -142,6 +179,8 @@ def build_alerts(
     anomaly_by_node = scores_anomaly.set_index("node_id")
 
     flagged = final_table[final_table["final_score"] >= threshold].sort_values("final_score", ascending=False)
+    if top_k is not None:
+        flagged = flagged.head(top_k)
 
     alerts = []
     for i, row in enumerate(flagged.itertuples(index=False)):

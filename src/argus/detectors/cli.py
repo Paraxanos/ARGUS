@@ -15,7 +15,7 @@ import typer
 from argus.detectors.coinjoin import detect_coinjoin_rounds
 from argus.detectors.pattern_sim import detect_pattern_similarity, pattern_sim_rows
 from argus.detectors.peeling import detect_peeling_chains
-from argus.detectors.risk_ppr import compute_risk_scores, risk_score_rows
+from argus.detectors.risk_ppr import DAMPING, compute_risk_scores, risk_score_rows
 from argus.detectors.scores import coinjoin_round_rows, peeling_chain_rows, write_scores
 from argus.fusion.evidence import save_encoder_checkpoint
 from argus.graph.export import read_graph_pickle
@@ -24,7 +24,15 @@ app = typer.Typer()
 
 
 @app.command()
-def run(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
+def run(
+    data_dir: Path = typer.Option(Path("data"), "--data-dir"),
+    risk_damping: float = typer.Option(
+        DAMPING, "--risk-damping",
+        help="Personalized PageRank damping for the risk head. Higher = lower restart "
+             "probability = propagation reaches farther from a sparse seed set. Real-data "
+             "widening lever (see docs/WRITEUP.md's benchmarking findings); default unchanged.",
+    ),
+) -> None:
     g = read_graph_pickle(data_dir / "artifacts" / "graph.pkl")
     node_features = pd.read_parquet(data_dir / "artifacts" / "node_features.parquet")
 
@@ -64,7 +72,7 @@ def run(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
     write_scores(pattern_rows, data_dir / "artifacts" / "scores_pattern.parquet")
 
     seeds = pd.read_parquet(data_dir / "ground_truth" / "seeds.parquet")
-    risk_scores = compute_risk_scores(g, seeds["wallet_id"].tolist())
+    risk_scores = compute_risk_scores(g, seeds["wallet_id"].tolist(), damping=risk_damping)
     risk_rows = risk_score_rows(risk_scores)
     write_scores(risk_rows, data_dir / "artifacts" / "scores_risk.parquet")
 

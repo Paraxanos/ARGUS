@@ -35,7 +35,22 @@ def run_ingest(input_path: Path, fmt: str, rejects_path: Path) -> pd.DataFrame:
                 )
                 continue
 
-            asn, geo_country = enrich(coerced["src_ip"])
+            enriched = enrich(coerced["src_ip"])
+            if enriched is None:
+                rejects_f.write(
+                    json.dumps(
+                        {
+                            "source_format": fmt,
+                            "row_index": index,
+                            "reason": "unresolvable_geoip",
+                            "txid": raw_row.get("txid"),
+                        }
+                    )
+                    + "\n"
+                )
+                continue
+
+            asn, geo_country = enriched
             coerced["asn"] = asn
             coerced["geo_country"] = geo_country
             valid_rows.append(coerced)

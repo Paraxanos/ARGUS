@@ -158,6 +158,82 @@ def test_alerts_include_attention_evidence_via_checkpoint_round_trip(pipeline_ou
     assert any("attention weighted" in a["rationale"] for a in grew)
 
 
+def test_build_alerts_top_k_caps_a_low_prevalence_flood():
+    """Real-data finding (ARGUS dataset Track M benchmarking report,
+    2026-09-30): at ~0.2% real-world illicit prevalence, ALERT_THRESHOLD
+    alone passed ~78% of the scored universe (31,059 of 40,016 nodes) —
+    calibrated against synthetic data's much higher prevalence. Reproduce
+    that shape locally (no real dataset needed, just the marker: many
+    benign nodes clustered just above threshold, a few genuinely high
+    scorers) and confirm top_k bounds the queue regardless of how many
+    nodes clear the threshold, while never dropping the highest scorers.
+    """
+    n_benign = 998
+    benign_ids = [f"benign_{i}" for i in range(n_benign)]
+    benign_scores = [0.60 + 0.15 * (i / n_benign) for i in range(n_benign)]  # all clear ALERT_THRESHOLD=0.6
+    illicit_ids = ["illicit_0", "illicit_1"]
+    illicit_scores = [0.97, 0.99]
+
+    final_table = pd.DataFrame(
+        {
+            "node_id": benign_ids + illicit_ids,
+            "final_score": benign_scores + illicit_scores,
+            "pattern": [0.5] * (n_benign + 2),
+            "risk": [0.5] * (n_benign + 2),
+            "anomaly": [0.5] * (n_benign + 2),
+        }
+    )
+    empty_scores = pd.DataFrame(columns=["node_id", "score", "reason_code", "evidence_json"])
+
+    flooded = build_alerts(final_table, empty_scores, empty_scores, empty_scores, ALERT_THRESHOLD)
+    assert len(flooded) == n_benign + 2  # reproduces the flood: everyone clears the threshold
+
+    capped = build_alerts(final_table, empty_scores, empty_scores, empty_scores, ALERT_THRESHOLD, top_k=10)
+    assert len(capped) == 10
+    capped_scores = [a["final_score"] for a in capped]
+    assert capped_scores == sorted(capped_scores, reverse=True)
+    assert {"illicit_0", "illicit_1"}.issubset({a["node_id"] for a in capped})
+
+
+def test_component_table_anomaly_admission_widens_universe_without_flooding():
+    """Real-data finding (ARGUS dataset Track M benchmarking report,
+    2026-09-30): with only 17 real seeds, risk propagation + pattern hits
+    together covered just 14.7% of illicit targets — most of the anomaly
+    head's own signal (which covers every node) never had a chance to
+    matter, because component_table never admits a node on anomaly alone.
+    Reproduce the marker locally: a few "quiet illicit" nodes with no
+    pattern/risk hit but an elevated anomaly score, among a large all-normal
+    population — confirm they're missed by default and captured once
+    admitted, without the all-normal population flooding the universe too.
+    """
+    quiet_illicit = [f"quiet_{i}" for i in range(3)]
+    normal_population = [f"normal_{i}" for i in range(500)]
+
+    # Explicit dtypes, not pd.DataFrame(columns=[...]): an empty frame with
+    # inferred object dtype triggers a pandas FutureWarning on the later
+    # reindex().fillna(0.0) — real detector output always has proper dtypes,
+    # so this is purely a hand-built-empty-fixture wrinkle, not a production
+    # code path this test needs to exercise.
+    empty_str_score = pd.DataFrame({"node_id": pd.Series(dtype=str), "score": pd.Series(dtype=float)})
+    scores_pattern = empty_str_score.assign(reason_code=pd.Series(dtype=str), evidence_json=pd.Series(dtype=str))
+    scores_risk = scores_pattern.copy()
+    scores_anomaly = pd.DataFrame(
+        {
+            "node_id": quiet_illicit + normal_population,
+            "score": [0.95] * len(quiet_illicit) + [0.5] * len(normal_population),
+            "reason_code": ["ANOMALY_ZSCORE=3.00"] * len(quiet_illicit) + ["ANOMALY_ZSCORE=0.00"] * len(normal_population),
+            "evidence_json": ["{}"] * (len(quiet_illicit) + len(normal_population)),
+        }
+    )
+
+    default_table = component_table(scores_pattern, scores_risk, scores_anomaly)
+    assert default_table.empty, "quiet illicit nodes are missed by default — no pattern/risk hit"
+
+    widened_table = component_table(scores_pattern, scores_risk, scores_anomaly, anomaly_admission_threshold=0.9)
+    assert set(widened_table["node_id"]) == set(quiet_illicit)
+    assert "normal_0" not in set(widened_table["node_id"]), "widening must not flood in the all-normal population"
+
+
 def test_fallback_blend_when_insufficient_labels():
     table = pd.DataFrame(
         {"node_id": ["a", "b", "c"], "pattern": [0.9, 0.1, 0.5], "risk": [0.8, 0.2, 0.5], "anomaly": [0.5, 0.5, 0.5]}
