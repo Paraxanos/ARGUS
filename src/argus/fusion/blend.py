@@ -117,6 +117,72 @@ def _fit_calibrated_blend(labeled: pd.DataFrame) -> LogisticRegression | None:
     return model
 
 
+# --- Label-free and held-out fusion (real-data generalisation) -----------------------------------------------
+# compute_final_scores() below fits its logistic blend on ground_truth/entities.parquet of the SAME data it then
+# scores: on any labelled benchmark that is in-sample fitting (the evaluation labels leak into the scores), and on
+# real, unlabelled data it silently falls back to FALLBACK_WEIGHTS. The two functions below replace it:
+#   * rank blend (default, needs no labels): each head's score is turned into a percentile rank within this run's
+#     universe, so the blend means the same thing at any prevalence or score scale; a head with no signal for a
+#     node (score 0) contributes 0, not a rank. Weights are fixed a priori from the heads' evidential strength:
+#     provenance from known-bad seeds > structural laundering pattern > generic anomaly.
+#   * held-out model: a logistic blend fitted on a SEPARATE labelled dev run (fit_blend_model, saved as JSON) and
+#     applied unchanged to any other run (apply_blend_model) — never fitted on the data it scores.
+# Chosen on two held-out dev windows (ARGUS dataset, 23 Sep 2026 00-06 and 06-12 UTC), never on test data: the
+# anomaly head ranked illicit nodes BELOW licit ones on both (AUC 0.37 / 0.34 for the isolation forest, 0.21 for the
+# autoencoder) -- on realistic data "unusual" is not "illicit" -- so it no longer votes in the ranking; its score is
+# still computed and shown as alert evidence. With it removed, mean AP rose 0.75 -> 0.77 and precision@50 0.75 -> 0.80.
+RANK_WEIGHTS = {"risk": 0.55, "pattern": 0.45, "anomaly": 0.0}
+HEADS = ("pattern", "risk", "anomaly")
+
+
+def compute_rank_scores(table: pd.DataFrame, weights: dict[str, float] = RANK_WEIGHTS) -> tuple[pd.DataFrame, str]:
+    table = table.copy()
+    total = sum(weights.values())
+    final = 0.0
+    for head, w in weights.items():
+        if w <= 0:
+            continue
+        values = table[head]
+        rank = values.rank(pct=True, method="average")
+        if head != "anomaly":
+            rank = rank.where(values > 0, 0.0)
+        table[f"{head}_rank"] = rank
+        final = final + w * rank
+    table["final_score"] = final / total if total > 0 else 0.0
+    return table, "rank_blend"
+
+
+def fit_blend_model(table: pd.DataFrame, ground_truth_entities: pd.DataFrame) -> dict | None:
+    """Fits the logistic blend on this run's labelled nodes and returns it as plain JSON-able numbers. Use ONLY on
+    a dev run, then apply the saved model elsewhere with apply_blend_model."""
+    labeled = _labeled_rows(table, ground_truth_entities)
+    model = _fit_calibrated_blend(labeled)
+    if model is None:
+        return None
+    return {"features": list(HEADS), "coef": [float(c) for c in model.coef_[0]], "intercept": float(model.intercept_[0]),
+            "n_labeled": int(len(labeled)), "n_positive": int(labeled["label"].sum())}
+
+
+def apply_blend_model(table: pd.DataFrame, model: dict) -> tuple[pd.DataFrame, str]:
+    import numpy as np
+
+    table = table.copy()
+    z = model["intercept"] + sum(c * table[f] for c, f in zip(model["coef"], model["features"]))
+    table["final_score"] = 1.0 / (1.0 + np.exp(-z))
+    return table, "held_out_logistic"
+
+
+def dedupe_by_entity(final_table: pd.DataFrame, entities: pd.DataFrame | None) -> pd.DataFrame:
+    """One alert per resolved entity: keep each entity's highest-scoring wallet, so a single actor with many
+    addresses does not fill the queue. Transactions (not in entities.parquet) are kept as they are."""
+    if entities is None or entities.empty:
+        return final_table
+    ent = entities.set_index("wallet_id")["entity_id"]
+    t = final_table.sort_values("final_score", ascending=False).copy()
+    t["_entity"] = t["node_id"].map(ent).fillna(t["node_id"])
+    return t.drop_duplicates("_entity").drop(columns="_entity")
+
+
 def compute_final_scores(table: pd.DataFrame, ground_truth_entities: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """Trains a calibrated logistic blend on synthetic labels from
     ground_truth/entities.parquet when enough labeled nodes exist (>=

@@ -32,12 +32,33 @@ from argus.graph.export import export_edges, read_graph_pickle, write_graph_pick
 app = typer.Typer()
 
 
+def _ground_truth(data_dir: Path) -> pd.DataFrame | None:
+    """Ground truth is used here for printed metrics only, never to fit anything; real
+    (unlabelled) data has none, which must not stop the pipeline."""
+    path = data_dir / "ground_truth" / "entities.parquet"
+    return pd.read_parquet(path) if path.exists() else None
+
+
+def _metrics_text(predicted: pd.DataFrame, ground_truth: pd.DataFrame | None) -> str:
+    if ground_truth is None or ground_truth.empty:
+        return "precision=n/a recall=n/a f1=n/a (no ground truth)"
+    m = evaluate_pairwise(predicted, ground_truth)
+    return (f"precision={m['precision']:.4f} recall={m['recall']:.4f} f1={m['f1']:.4f} "
+            f"tp_pairs={m['tp_pairs']} predicted_pairs={m['predicted_pairs']} true_pairs={m['true_pairs']}")
+
+
 @app.command()
-def resolve(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
+def resolve(
+    data_dir: Path = typer.Option(Path("data"), "--data-dir"),
+    type_change: bool = typer.Option(
+        False, "--type-change",
+        help="Also apply the address-type change heuristic (argus.er.union_find.type_change_output).",
+    ),
+) -> None:
     canonical_path = data_dir / "canonical" / "transactions.parquet"
     df = pd.read_parquet(canonical_path)
 
-    uf, links = resolve_entities(df)
+    uf, links = resolve_entities(df, type_change=type_change)
 
     graph_path = data_dir / "artifacts" / "graph.pkl"
     g = read_graph_pickle(graph_path)
@@ -48,15 +69,8 @@ def resolve(data_dir: Path = typer.Option(Path("data"), "--data-dir")) -> None:
     entities_path = data_dir / "artifacts" / "entities.parquet"
     write_entities_parquet(uf, entities_path)
 
-    ground_truth = pd.read_parquet(data_dir / "ground_truth" / "entities.parquet")
     predicted = pd.read_parquet(entities_path)
-    metrics = evaluate_pairwise(predicted, ground_truth)
-
-    typer.echo(
-        f"clusters={len(uf.groups())} co_spend_links={len(links)} "
-        f"precision={metrics['precision']:.4f} recall={metrics['recall']:.4f} f1={metrics['f1']:.4f} "
-        f"tp_pairs={metrics['tp_pairs']} predicted_pairs={metrics['predicted_pairs']} true_pairs={metrics['true_pairs']}"
-    )
+    typer.echo(f"clusters={len(uf.groups())} co_spend_links={len(links)} {_metrics_text(predicted, _ground_truth(data_dir))}")
 
 
 @app.command()
@@ -83,6 +97,11 @@ def embed(
              "light-wallet server) before embedding training only — real-data over-merge guard, "
              "inert no-op on this repo's own synthetic data.",
     ),
+    skip: bool = typer.Option(
+        False, "--skip",
+        help="Skip pass 2 entirely: pass 1's entities.parquet and graph stay as they are, and no "
+             "SAME_ENTITY edges are added. Use when pass 2 does not beat pass 1 on a held-out dev set.",
+    ),
 ) -> None:
     """ER pass 2: heterogeneous GraphSAGE wallet embeddings (argus.models.sage)
     + HDBSCAN clustering, reconciled against pass 1's entities.parquet (merge
@@ -91,6 +110,11 @@ def embed(
     and `features build` (its node_features.parquet is this pass's embedding
     input) — see the Makefile's `er2` target.
     """
+    if skip:
+        pass1_entities = pd.read_parquet(data_dir / "artifacts" / "entities.parquet")
+        typer.echo(f"pass2=skipped (pass-1 entities kept) {_metrics_text(pass1_entities, _ground_truth(data_dir))}")
+        return
+
     graph_path = data_dir / "artifacts" / "graph.pkl"
     g = read_graph_pickle(graph_path)
     node_features = pd.read_parquet(data_dir / "artifacts" / "node_features.parquet")
@@ -119,9 +143,6 @@ def embed(
     write_graph_pickle(g, graph_path)
     export_edges(g, data_dir / "artifacts" / "graph_edges.parquet")
 
-    ground_truth = pd.read_parquet(data_dir / "ground_truth" / "entities.parquet")
-    metrics = evaluate_pairwise(result.entities, ground_truth)
-
     n_merges = int((result.log["action"] == "merge").sum()) if not result.log.empty else 0
     n_splits = int((result.log["action"] == "split").sum()) if not result.log.empty else 0
     n_touched = int((result.entities["source"] == "pass2").sum())
@@ -130,7 +151,7 @@ def embed(
     typer.echo(
         f"{loss_prefix}wallets_embedded={len(wallet_embeddings)} merges={n_merges} splits={n_splits} "
         f"wallets_touched=pass2:{n_touched} same_entity_links={len(result.same_entity_links)} "
-        f"precision={metrics['precision']:.4f} recall={metrics['recall']:.4f} f1={metrics['f1']:.4f}"
+        f"{_metrics_text(result.entities, _ground_truth(data_dir))}"
     )
 
 

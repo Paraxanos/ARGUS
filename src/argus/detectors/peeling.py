@@ -180,6 +180,57 @@ def _walk_chains(by_source: dict[str, list[tuple[str, float, str, float, float]]
     return chains
 
 
+# --- Behavioural chain scoring (real-data generalisation) ---------------------------------------------------
+# The structural detector above finds peel-shaped chains, but on real traffic most of them are innocent (exchange
+# hot-wallet withdrawals, wallets spending their own change): every chain it returns scores ~0.9, so the head cannot
+# rank. Two label-free signals from the forensics literature separate laundering from service withdrawals:
+#   * cash-out: criminals peel to exchange DEPOSIT addresses, which the exchange later sweeps into a multi-input
+#     consolidation; an exchange's withdrawal peels go to its customers, whose addresses are not swept like that.
+#     swept_fraction = share of a chain's peel outputs later spent in a non-CoinJoin transaction with at least
+#     SWEEP_MIN_INPUTS inputs.
+#   * source: a chain started by an extreme-activity wallet (degree above this run's SERVICE_DEGREE_QUANTILE) is
+#     most likely a service's hot wallet.
+# score = confidence * (0.5 + 0.5 * swept_fraction) * (SERVICE_SOURCE_FACTOR if service source else 1). The factors
+# are fixed a priori (they halve or keep the structural confidence); nothing is fitted to labels.
+SWEEP_MIN_INPUTS = 3
+SERVICE_DEGREE_QUANTILE = 0.999
+SERVICE_SOURCE_FACTOR = 0.5
+
+
+def chain_behaviour_scores(g: ig.Graph, chains: list[PeelingChain]) -> dict[str, dict]:
+    from argus.er.union_find import is_coinjoin_like
+
+    funds_in, pays_out = _build_funds_pays_index(g)
+    spent_in: dict[str, list[str]] = {}
+    for txid, inputs in funds_in.items():
+        for w, _ in inputs:
+            spent_in.setdefault(w, []).append(txid)
+    sweeps = {txid for txid, inputs in funds_in.items()
+              if len({w for w, _ in inputs}) >= SWEEP_MIN_INPUTS
+              and not is_coinjoin_like([w for w, _ in inputs], [a for _, a in pays_out.get(txid, [])])}
+    degree: dict[str, int] = {}
+    for txid, inputs in funds_in.items():
+        for w, _ in inputs:
+            degree[w] = degree.get(w, 0) + 1
+    for txid, outputs in pays_out.items():
+        for w, _ in outputs:
+            degree[w] = degree.get(w, 0) + 1
+    ordered = sorted(degree.values()) or [0]
+    cutoff = ordered[min(len(ordered) - 1, int(SERVICE_DEGREE_QUANTILE * len(ordered)))]
+
+    out: dict[str, dict] = {}
+    for chain in chains:
+        peels = []
+        for txid, _from, dominant_to, _amt in chain.hops:
+            peels += [w for w, _ in pays_out.get(txid, []) if w != dominant_to]
+        swept = sum(1 for w in peels if any(t in sweeps for t in spent_in.get(w, [])))
+        swept_fraction = swept / len(peels) if peels else 0.0
+        service_source = degree.get(chain.hops[0][1], 0) > cutoff
+        score = chain.confidence * (0.5 + 0.5 * swept_fraction) * (SERVICE_SOURCE_FACTOR if service_source else 1.0)
+        out[chain.chain_id] = {"score": score, "swept_fraction": round(swept_fraction, 3), "service_source": service_source}
+    return out
+
+
 def detect_peeling_chains(g: ig.Graph) -> list[PeelingChain]:
     funds_in, pays_out = _build_funds_pays_index(g)
     by_source = _qualifying_hops_by_source(funds_in, pays_out)
