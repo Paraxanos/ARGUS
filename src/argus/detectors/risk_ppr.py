@@ -53,7 +53,14 @@ def _entity_link_subgraph(g: ig.Graph) -> ig.Graph:
     return sub.as_undirected(mode="collapse")
 
 
-def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str]) -> list[RiskScore]:
+def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str], damping: float = DAMPING) -> list[RiskScore]:
+    """damping exposed as a parameter (default DAMPING, unchanged behavior):
+    real-data finding (ARGUS dataset Track M benchmarking report,
+    2026-09-30) — a sparse real seed set (17 wallets) needs propagation to
+    reach farther than this dataset's own default was tuned for. Higher
+    damping = lower restart probability = more hops before the walk resets
+    to a seed, i.e. wider propagation from the same seed set.
+    """
     seed_ids = set(seed_wallet_ids)
     sub = _entity_link_subgraph(g)
     names = sub.vs["name"] if sub.vcount() > 0 else []
@@ -69,7 +76,7 @@ def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str]) -> list[RiskSco
 
     seed_indices = sorted({name_to_index[w] for w in seed_ids if w in name_to_index})
     if seed_indices:
-        pagerank = sub.personalized_pagerank(reset_vertices=seed_indices, damping=DAMPING, directed=False)
+        pagerank = sub.personalized_pagerank(reset_vertices=seed_indices, damping=damping, directed=False)
         max_pr = max(pagerank) if pagerank else 0.0
         if max_pr > 0:
             pagerank = [p / max_pr for p in pagerank]

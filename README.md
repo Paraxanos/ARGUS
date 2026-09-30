@@ -164,3 +164,43 @@ make test
   masked it locally. Fixed: `make dashboard` now passes `--server.headless=true
   --browser.gatherUsageStats=false`, verified against a scratch fake-`HOME` with no `.streamlit`
   directory at all. See `docs/WRITEUP.md`'s "Dashboard" section.
+- **A teammate's real-data benchmarking run (2026-09-30) found the fixed 0.6 alert threshold
+  floods the queue at realistic (~0.2%) illicit prevalence** (31,059 alerts from 40,016 scored
+  nodes) — confirmed by reading `fusion/blend.py`'s own calibration comment, which admits the
+  threshold was tuned to synthetic data's much higher prevalence. Fixed: `build_alerts()` gained
+  a `top_k` cap (`fusion/cli.py --top-k`, default 500) applied after the threshold floor,
+  verified against a hand-built low-prevalence fixture (no real data needed). Four more findings
+  from the same report (ER pass-2 over-merging, a too-narrow scored universe, an uninformative
+  anomaly head, and peeling false positives on real transaction shapes) are diagnosed but not yet
+  fixed — see `docs/WRITEUP.md`'s "Real-data benchmarking findings" section for the full
+  diagnosis plan.
+- **Two more findings from the same report are now fixed (opt-in, off by default):** ER pass 2
+  was dropping real-data precision from 0.960 to 0.209 by splitting pass 1's mostly-correct
+  clusters and over-merging wallets sharing broadcast infrastructure — `er/cli.py embed` gained
+  `--protect-cospend-clusters`, `--min-merge-probability`, and `--drop-broadcaster-outliers`. And
+  only 14.7% of illicit targets ever entered the scored universe — `fusion/cli.py
+  --anomaly-admission-threshold` and `detectors/cli.py --risk-damping` widen it. All four flags
+  default to the exact pre-fix behavior; verified against hand-built fixtures reproducing each
+  marker, no real data touched. See `docs/WRITEUP.md`'s "Real-data benchmarking findings"
+  section.
+- **The anomaly head's real-data flatness and ER pass 2's real-data loss blowup were tested
+  against two hypotheses (pure scale, degree skew) and NEITHER held up** — reported honestly
+  rather than forcing an unverified fix. `models/anomaly.py` gained per-epoch loss tracking
+  (`AnomalyResult.losses`, matching `models/sage.py`'s existing convention) so any future run can
+  directly tell whether training converged. See `docs/WRITEUP.md`'s "Real-data benchmarking
+  findings" section for the concrete, non-sensitive handoff ask for the benchmarking team's next
+  re-run.
+- **A real-shaped IP address (outside this generator's synthetic pool) or IPv6 used to crash the
+  entire ingest run** — fixed: `ingest/geoip.py` now supports real MaxMind-format databases
+  (`ARGUS_GEOIP_ASN_MMDB`/`ARGUS_GEOIP_COUNTRY_MMDB`, opt-in) and rejects any unresolvable
+  address to `rejects.log` instead of crashing, verified against a mocked `geoip2.database.Reader`
+  (no real database file needed).
+- **`sklearn.cluster.HDBSCAN.fit`'s Windows stack overflow at real-world wallet counts was
+  reproduced exactly** — 150,000 purely synthetic random embeddings (no real data) crashed with
+  exit code 127 and no Python traceback on this same machine, matching the report's observed
+  symptom precisely. Fixed and confirmed: `argus.er.embed_cluster.run_with_big_stack()` runs
+  HDBSCAN on a 128 MB thread stack, always on (no behavioral downside — it only changes where
+  the recursion runs, not the result) — the exact same 150,000-point case that crashed with
+  exit 127 now completes successfully (687.2s, exit code 0, 150,000 rows, 9,136 non-noise).
+  Peeling false positives on real transaction shapes remain diagnosed but not yet fixed (the
+  fix requires a new synthetic hard-negative pattern, not attempted this session).

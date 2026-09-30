@@ -330,6 +330,201 @@ than every node sharing the exact same anomaly value. The alert threshold (0.6) 
 from the placeholder era and still sits below the risk/seed cluster for the same reason
 documented then — see `blend.py`'s inline comments for the full reasoning.
 
+## Real-data benchmarking findings and Tier-1 fix (2026-09-30)
+
+A teammate's benchmarking report ran the full pipeline (commit `cff9f19`) against a realistic
+Bitcoin-shaped dataset (Track M, ~146k transactions, ~0.2% illicit prevalence, kept external to
+this repo — see the fix plan below for why). Five genuine problems were found; the diagnosis
+plan treats each as a **marker our synthetic generator lacks** (multi-input transactions, IP
+reuse across unrelated owners, realistic scale, benign peeling-shaped chains, a sparse fixed
+seed set) and fixes/verifies each locally by reproducing the marker in isolation — a hand-built
+fixture or a synthetic-scale stress test — never the hidden dataset itself. The benchmarking
+team re-measures against the real data once each fix lands.
+
+**Tier 1 (done): alert threshold floods the queue at realistic prevalence.** Confirmed by
+reading, not assuming: `ALERT_THRESHOLD = 0.6` (`fusion/blend.py`) was calibrated against
+synthetic data's own comment ("keeps the entire fusion universe... already a curated,
+reasonably-sized watchlist") — a prevalence artifact, not a severity cutoff. At the real
+dataset's ~0.2% prevalence the report measured 31,059 alerts from 40,016 scored nodes (78%).
+Fix: `build_alerts()` gained an optional `top_k` cap (`DEFAULT_TOP_K = 500`), applied **after**
+the threshold floor and the existing descending sort — the threshold still excludes genuinely
+low-confidence nodes, `top_k` bounds investigator-facing queue size regardless of how many nodes
+clear it. `fusion/cli.py` exposes `--top-k` (default `DEFAULT_TOP_K`, `0` = unbounded, matching
+the pre-fix behavior exactly). Verified with a hand-built low-prevalence fixture reproducing the
+marker directly (998 benign nodes clustered just above threshold, 2 planted high-scorers, no
+real data involved) — `tests/test_fusion.py::test_build_alerts_top_k_caps_a_low_prevalence_flood`
+confirms the flood reproduces without the cap and that `top_k` bounds it while never dropping
+the true high scorers. Direct callers of `build_alerts()` (existing tests) are unaffected —
+`top_k` defaults to `None`. **Not yet re-measured against the real dataset** — that's the
+benchmarking team's own next step; the report's target (queue ≤ 500, precision@100 ≥ 0.5) is the
+number to watch for. Note this changes `make pipeline`'s own default output on synthetic data
+too (previously up to 2,109 alerts unbounded, now capped at 500 by default) — the "Measured on
+the full dataset" numbers just above this section reflect a run from before this change and are
+not being force-regenerated for this fix alone; `--top-k=0` reproduces the old, unbounded number
+exactly if needed.
+
+**Tier 2 (done): ER pass-2 over-merging, and a scored universe too narrow to
+hold most illicit nodes.**
+
+*ER pass-2 over-merging.* The report measured pass 1 at precision 0.960 on
+real data (unlike this repo's own vacuous 0.0-recall synthetic result), yet
+pass 2 still dropped overall ER precision to 0.209 by splitting pass 1's
+(mostly correct) multi-wallet clusters and merging unrelated wallets that
+happened to share broadcast infrastructure (a light-wallet server relaying
+many owners' transactions). Three fixes, all opt-in (default off, so every
+existing test/behavior — including the deliberate split-capability test,
+`test_merge_and_split_and_noise_all_correct` — is untouched):
+- `reconcile_with_pass1(..., protect_multiwallet_pass1_entities=True)`: any
+  pass-1 entity with more than one wallet can never be split (its wallets
+  keep one shared provisional id regardless of individual hdbscan label) —
+  it stays fully eligible to be *merged* into a larger cross-entity group,
+  since that's a separate decision. Verified with a hand-built fixture
+  reproducing the exact split mechanism the existing test exercises,
+  confirming protection keeps the entity whole
+  (`test_protect_multiwallet_pass1_entities_never_splits`).
+- `reconcile_with_pass1(..., min_merge_probability=...)`: skips a merge
+  entirely unless every wallet in the triggering hdbscan cluster clears this
+  confidence floor — verified with an impossible-to-satisfy floor (1.1,
+  since hdbscan_prob is always <= 1.0) to avoid depending on HDBSCAN's exact
+  probability output (`test_min_merge_probability_blocks_low_confidence_merges`).
+- `drop_high_fanin_broadcasters()` (new function, `er/embed_cluster.py`):
+  drops BROADCAST_VIA edges into any IP node whose in-degree is a
+  population-relative outlier (z-score, same "don't trust one global
+  constant" principle as `detectors/pattern_sim.py`'s own adaptive gate) —
+  before embedding training only, never the persisted graph. Verified with a
+  hand-built graph fixture: one hub IP at fan-in 40 among 30 ordinary IPs at
+  fan-in 1-2 loses its edges; a too-small IP population is correctly a no-op
+  (`test_drop_high_fanin_broadcasters_removes_only_the_outlier_ip`,
+  `test_drop_high_fanin_broadcasters_is_noop_below_min_population`). Wired
+  into `er/cli.py embed` as `--drop-broadcaster-outliers`, alongside
+  `--protect-cospend-clusters` and `--min-merge-probability`.
+
+*Scored universe too narrow.* Only 14.7% of illicit targets ever entered the
+alert list — `component_table()`'s universe was pattern-or-risk hits only,
+by original design (anomaly scores every node, so admitting it unconditionally
+would blow the universe up to ~340k trivial rows). Fix:
+`component_table(..., anomaly_admission_threshold=...)` additionally admits
+any node whose anomaly score alone exceeds the cutoff — `None` (default)
+preserves the exact pre-existing universe. Verified with a hand-built
+fixture: 3 "quiet illicit" nodes (elevated anomaly score, no pattern/risk
+hit) among 500 all-normal nodes are missed by default and captured once
+admitted, without the all-normal population flooding in
+(`test_component_table_anomaly_admission_widens_universe_without_flooding`).
+Separately, `detectors/risk_ppr.compute_risk_scores()` now exposes `damping`
+(previously a hardcoded module constant) — higher damping = lower restart
+probability = propagation reaches farther from a sparse real seed set (17
+wallets). Verified directly: on a 7-node CO_SPEND chain, a farther node's
+score relative to the seed's own score is measurably higher under a higher
+damping value, the expected personalized-PageRank property
+(`test_higher_damping_widens_propagation_reach`). Both wired in as CLI flags
+(`fusion/cli.py --anomaly-admission-threshold`, `detectors/cli.py
+--risk-damping`), both off/unchanged by default.
+
+**Not yet re-measured against the real dataset** for either fix — that's the
+benchmarking team's own next step. Targets to watch: pass-2 F1 >= pass-1 F1
+(0.960 -> currently 0.209), and >= 50% of illicit targets in the scored
+universe (currently 14.7%).
+
+**Tier 3 (diagnosis only — two hypotheses tested and REJECTED, not
+confirmed): the anomaly head's real-data flatness and the ER pass-2 loss
+blowup are NOT pure scale or degree-skew artifacts.** Both `models/sage.py`
+(now tracks per-epoch loss via `TrainingResult.losses`, already existed) and
+`models/anomaly.py` (gained the same `AnomalyResult.losses` field this
+phase) can now answer "did training converge" directly on ANY future run,
+ours or the benchmarking team's — that instrumentation is the one concrete
+code change from this diagnosis. Two hypotheses for the report's findings
+were tested empirically and did not hold up, reported honestly rather than
+forcing a fix that isn't verified to help:
+
+- *Pure scale.* Generating our own synthetic data 4x larger (60k vs 15k
+  wallets, same generator, same fixed 30-epoch budget) barely moved either
+  model: GraphSAGE final loss 1.44 -> 1.48 (report's real-data finding was
+  1.79 -> 21.6, an order of magnitude), and the anomaly score distribution
+  was essentially identical (mean 0.485/0.486, std 0.107/0.108) at both
+  scales. If under-convergence from a fixed epoch budget were the cause, a
+  4x node-count jump should have shown meaningfully worse numbers — it did
+  not.
+- *Degree skew (the same shared-broadcaster-IP marker Tier 2's
+  `drop_high_fanin_broadcasters` targets).* Rewiring 30% of one run's
+  BROADCAST_VIA edges onto a single injected hub IP (in-degree 4,590) barely
+  moved GraphSAGE's loss either (1.44 baseline vs 1.40 hub-skewed vs 1.42
+  with the Tier-2 fix applied) — all three within noise of each other. A
+  single injected hub does not reproduce the report's loss blowup.
+
+Both models were mildly still-descending at epoch 30 in every condition
+tested (5-17% of that point's loss in the last 5 epochs) — a real, if minor,
+pre-existing inefficiency independent of either hypothesis, not something
+newly caused by scale or skew.
+
+**Conclusion:** the report's loss blowup and anomaly flatness are most
+likely driven by real transaction *content* (feature-value complexity,
+real-world amount/timing distributions our synthetic generator doesn't
+reproduce) rather than graph size or topology shape — genuinely not
+diagnosable further without the hidden dataset. **Handoff ask for the
+benchmarking team's next re-run** (aggregate stats only, no raw data needed):
+(1) the per-epoch GraphSAGE loss curve, now directly available via
+`TrainingResult.losses` — still descending at epoch 30 means "train longer,"
+a plateaued high value means "the features themselves are hard to
+reconstruct, not a training-time problem"; (2) the raw per-node `z_score`
+(not the sigmoid-squashed `score`) from `scores_anomaly.parquet`, split by
+the real ground truth's illicit/licit label — tells us whether the anomaly
+head has ANY separable signal on real data at all, independent of z-score's
+[0,1] compression.
+
+**Tier 4 (done): GeoIP real-address support, and a Windows HDBSCAN crash
+guard.**
+
+*GeoIP.* `ingest/geoip.py`'s synthetic-pool lookup (keyed on the generator's
+own fixed `/16` pool) used to crash the entire ingest run the moment it saw
+a real-shaped address outside that pool (e.g. `240.x.x.x`) or IPv6 — a real
+bug, not a hypothetical: this repo's OWN generator never produces those
+shapes, so the crash path was simply never exercised before real data hit
+it. Fixed: `enrich()` now returns `None` on any unresolvable address instead
+of raising, and `ingest/pipeline.py` rejects that row to `rejects.log`
+(`reason: "unresolvable_geoip"`) like any other bad row — never a crash.
+When `ARGUS_GEOIP_ASN_MMDB`/`ARGUS_GEOIP_COUNTRY_MMDB` point at real
+MaxMind-format databases, `enrich()` uses them via the already-pinned (until
+now genuinely unused) `geoip2` dependency instead of the synthetic pool,
+handling IPv6 natively; absent those two env vars this path is never
+reached, `make pipeline`'s own default behavior is unaffected. Verified
+against a mocked `geoip2.database.Reader` (no real database file needed,
+matching this repo's offline-testing standard) plus an ingest-level
+integration test confirming one bad `src_ip` is rejected while every other
+row in the same file still ingests normally
+(`tests/test_ingest_geoip.py`, `tests/test_ingest.py`).
+
+*HDBSCAN Windows stack overflow.* The report found `sklearn.cluster.HDBSCAN
+.fit`'s recursive single-linkage-tree construction overflows Windows'
+default 1 MB thread stack at real-world wallet counts (150k+) — a genuine
+platform limitation (Linux's default 8 MB stack doesn't hit this), not a
+bug in this repo's own code, crashing with no Python traceback, exit 127.
+**Reproduced exactly, with no real data at all:** `run_hdbscan()` on 150,000
+purely synthetic random embeddings (16-dim, no graph or GraphSAGE training —
+the crash is inside sklearn's own C-level recursion, which only cares about
+point count and dimensionality) on this same Windows machine terminated
+with **exit code 127 and no Python traceback**, matching the report's
+observed symptom precisely. It took far longer than the report's own
+observed ~4 minutes before crashing — plausibly because unclustered random
+Gaussian points are a harder case for the single-linkage tree than real,
+naturally-clustering embeddings, but the failure mode itself matches exactly.
+
+Fixed: `argus.er.embed_cluster.run_with_big_stack()` runs a given function
+on a thread with a 128 MB stack (vs. Windows' 1 MB default), always on (not
+an opt-in guard like Tier 2/3's — it changes nothing about the result, only
+where the C-level recursion runs), wrapping `er/cli.py embed`'s
+`run_hdbscan` call. Verified two ways: (1) unit-level — returns the wrapped
+function's value unchanged, propagates exceptions correctly, and actually
+requests the larger stack size before restoring the previous one afterward
+(`tests/test_er_embed_cluster.py`); (2) **the exact same 150,000-point
+reproduction that crashed with exit 127 above, rerun through
+`run_with_big_stack`, now completes successfully — 687.2s, exit code 0,
+150,000 rows returned, 9,136 non-noise** — confirming the fix resolves the
+specific crash it was built for, not just a plausible-looking mechanism.
+
+**Not ours to build:** exporting more hard negatives and seeds into the
+ground truth (`tools/export_to_argus_prototype.py`) lives in the dataset
+repo, not here.
+
 ## Explainable evidence extraction (Dev B, Phase 4)
 
 Architecture doc sec 4.4: "extract an evidence subgraph: the k-hop neighborhood restricted to

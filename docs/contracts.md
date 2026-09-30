@@ -23,6 +23,13 @@ Producer: `ingest`. One row per transaction event.
 - `fee` (float)
 - `script_type` (string)
 
+**GeoIP enrichment (real-data fix, 2026-09-30):** `geo_country`/`asn` come from
+`argus.ingest.geoip.enrich()` — the offline synthetic-pool lookup by default, or real
+MaxMind-format databases when `ARGUS_GEOIP_ASN_MMDB`/`ARGUS_GEOIP_COUNTRY_MMDB` are set (see
+that module's docstring and `docs/WRITEUP.md`'s "Real-data benchmarking findings" section). A
+`src_ip` unresolvable by either path is rejected to `rejects.log` (`reason:
+"unresolvable_geoip"`), never a crash.
+
 ## Graph schema
 
 Artifacts: `artifacts/graph.pkl` + `artifacts/graph_edges.parquet`. Producer: `graph`.
@@ -96,6 +103,13 @@ pointing here, per this doc's hard rule below.
 - `pass1_entities` (JSON-encoded list — the pass-1 entity ids involved)
 - `wallets` (JSON-encoded list — every wallet covered by this action)
 - `evidence_json`
+
+**Real-data guards (2026-09-30, all opt-in, default off):** `er/cli.py embed`
+gained `--protect-cospend-clusters` (never split a pass-1 entity with >1
+wallet), `--min-merge-probability` (skip low-confidence merges), and
+`--drop-broadcaster-outliers` (exclude population-outlier-fan-in IP nodes
+from embedding training) — see `docs/WRITEUP.md`'s "Real-data benchmarking
+findings" section for the real-data over-merge regression these address.
 
 ## `artifacts/node_features.parquet`
 
@@ -226,6 +240,18 @@ the flagged node — attention-based extraction is what fills that specific gap.
 **Consumer (Dev B Phase 5):** `dashboard/app.py` reads this file plus `node_features.parquet`
 (for graph node-type coloring) — read-only, produces no artifact of its own, so no new contract
 section is needed here.
+
+**Queue size (real-data finding, 2026-09-30):** this file's row count is no longer bounded by
+`ALERT_THRESHOLD` alone. `fusion/cli.py --top-k` (default `blend.DEFAULT_TOP_K = 500`, `0` =
+unbounded) caps it at the `top_k` highest-scoring nodes clearing the threshold — see
+`docs/WRITEUP.md`'s "Real-data benchmarking findings" section for why: at realistic (~0.2%)
+illicit prevalence the threshold alone let through 78% of the scored universe.
+
+**Universe width (real-data finding, 2026-09-30):** `fusion/cli.py
+--anomaly-admission-threshold` (default disabled) additionally admits a node on anomaly score
+alone, and `detectors/cli.py --risk-damping` (default unchanged) widens risk propagation reach —
+both address the same report's finding that only 14.7% of illicit targets ever entered the
+scored universe. See `docs/WRITEUP.md`'s "Real-data benchmarking findings" section.
 
 ## Hard rule
 

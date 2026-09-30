@@ -59,6 +59,38 @@ def test_score_decays_with_distance():
     assert "w4" not in by_id  # unreachable from any seed over CO_SPEND — no row emitted
 
 
+def test_higher_damping_widens_propagation_reach():
+    """Real-data lever (ARGUS dataset Track M benchmarking report,
+    2026-09-30): a sparse real seed set (17 wallets) needs risk to reach
+    farther than this dataset's own default DAMPING was tuned for — damping
+    is now an exposed parameter for exactly this. Confirm the mechanism
+    directly on a longer CO_SPEND chain: a farther node's score relative to
+    the seed's own score should be higher under a higher damping value
+    (standard personalized-PageRank property — higher damping = lower
+    restart probability = score reaches farther before decaying).
+    """
+    g = ig.Graph(directed=True)
+    names = [f"w{i}" for i in range(7)]
+    g.add_vertices(len(names))
+    g.vs["name"] = names
+    g.vs["type"] = ["Wallet"] * len(names)
+    edges = [(i, i + 1) for i in range(6)]
+    g.add_edges(edges)
+    n = len(edges)
+    g.es["type"] = ["CO_SPEND"] * n
+    g.es["confidence"] = [0.9] * n
+    g.es["amount"] = [None] * n
+    g.es["timestamp"] = [None] * n
+    g.es["port"] = [None] * n
+
+    default_scores = {r.node_id: r.score for r in compute_risk_scores(g, ["w0"])}
+    wider_scores = {r.node_id: r.score for r in compute_risk_scores(g, ["w0"], damping=0.99)}
+
+    default_ratio = default_scores["w6"] / default_scores["w0"]
+    wider_ratio = wider_scores["w6"] / wider_scores["w0"]
+    assert wider_ratio > default_ratio
+
+
 def test_precision_at_50_on_full_dataset(tmp_path):
     cfg = SynthConfig(
         random_seed=31,

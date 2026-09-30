@@ -26,13 +26,20 @@ grep -rn "import requests|import urllib|import http\.client|import socket|aiohtt
 ```
 
 Zero matches anywhere in `src/`. Also checked specifically: `geoip2` is a pinned dependency
-(originally added in Phase 0, before the offline-GeoIP design decision was made) but is never
-actually imported anywhere in `src/` — `src/argus/ingest/geoip.py` implements its own fully
-offline, deterministic lookup instead (see that module's docstring for why: this dataset's
-IPs are synthetic, so a real MaxMind lookup would be meaningless even if one were available).
-`geoip2` is consequently a dead dependency as far as runtime behavior goes; it was left in
-`requirements.txt` rather than removed, since removing dependencies wasn't asked for here and
-is a separate decision from the offline-runtime audit.
+(originally added in Phase 0, before the offline-GeoIP design decision was made). For this
+repo's own synthetic data, `src/argus/ingest/geoip.py` uses its own fully offline, deterministic
+lookup instead (see that module's docstring for why: this dataset's IPs are synthetic, so a real
+MaxMind lookup would be meaningless even if one were available) — `geoip2` stays a dead
+dependency on that path.
+
+**Update (real-data fix, 2026-09-30):** `geoip2` IS now actually used, opt-in only, when
+`ARGUS_GEOIP_ASN_MMDB`/`ARGUS_GEOIP_COUNTRY_MMDB` point at real MaxMind-format database files —
+see `docs/WRITEUP.md`'s "Real-data benchmarking findings" section. This stays fully offline:
+`geoip2.database.Reader` (used here) reads a local `.mmdb` file directly — it is NOT
+`geoip2.webservice.Client`, MaxMind's separate network-calling API client, which this codebase
+does not import anywhere (confirmed by the same grep above; `webservice` never appears in
+`src/`). Absent those two env vars, this code path is never reached at all — `make pipeline`'s
+own default behavior, and this document's own verification above, are both unaffected.
 
 ### 2. Live simulated network-disabled run (the actual empirical test)
 
