@@ -657,3 +657,45 @@ actually run and how, and the codebase audit for accidental network calls.
   version entirely) — see "Explainable evidence extraction" above and `docs/contracts.md`.
 - **DONE (Phase 5): Streamlit dashboard** (`dashboard/app.py`) — ranked alert table + pyvis
   evidence-subgraph graph view; see "Dashboard" above and `docs/contracts.md`.
+
+## Real-data generalisation (branch `improve/generalization`, 2026-09-30)
+
+**Why.** On the ARGUS dataset, `fusion/blend.py`'s calibrated blend was fitted on
+`ground_truth/entities.parquet` of the same run it scored — in-sample. On real, unlabelled data it falls back to
+`FALLBACK_WEIGHTS` + `ALERT_THRESHOLD=0.6`, which raised 2–4 alerts, all wrong, on every dataset window tested.
+The changes below make every stage work without labels, and every choice was made on held-out dev data.
+
+**Protocol.** Two dev windows (ARGUS dataset, 23 Sep 2026 00–06 and 06–12 UTC) for all design choices; a sealed test
+(24 Sep 00–06) run once at the end; then a fresh window (24 Sep 12–18) that nobody had looked at, whose injected
+crime flows share nothing with any earlier set. Seeds are excluded from every hit count.
+
+**Changes** (defaults in brackets; every new behaviour has a CLI flag):
+- `fusion`: label-free percentile-rank blend [`--fusion-mode rank`, weights risk 0.55 / pattern 0.45 / anomaly 0];
+  a blend fitted on a dev run can be saved (`--save-fusion-model`) and applied elsewhere (`--fusion-mode model`);
+  one alert per resolved entity [`--dedupe-entities`]; `in-sample` keeps the old behaviour for comparison.
+- `detectors/risk_ppr`: money-flow taint in time order [`--risk-mode both`] — ordinary transactions carry their
+  owner's full taint (common-input ownership), CoinJoin-shaped ones split it by value (haircut), extreme-degree
+  service wallets absorb taint without passing it on (cutoff = this run's 99.9th-percentile degree).
+- `detectors/peeling` + `scores`: chains scored by behaviour [`--pattern-scoring behaviour`] — share of peels later
+  swept into a consolidation (cash-out to an exchange) and whether the source is a service hot wallet; CoinJoin
+  participants scored at half [`--coinjoin-participant-factor 0.5`] (mixing is a signal, not proof).
+- `models/iforest`: label-free isolation-forest ensemble [`--anomaly-scorer iforest`, opt-in], stable across
+  seeds (rank correlation 0.97–0.997). Both anomaly scorers ranked illicit nodes BELOW licit ones on both dev
+  windows (AUC 0.21–0.37), so anomaly has weight 0 in the ranking and is shown as evidence only.
+- `er`: general equal-output CoinJoin rule in pass 1; address-type change heuristic [`--type-change`, off:
+  +0.02 F1 but −5 pts precision on dev]; pass 2 can be skipped [`er embed --skip`] — with every guard on it still
+  lowered F1 on dev (0.202 -> 0.142), so the real-data runs below skip it. Ground truth is optional everywhere.
+
+**Results** (`--skip` for er2, `--anomaly-scorer iforest`, all other defaults; precision = share of the top-k alerts
+that are illicit wallets or transactions):
+
+| Window | Code | P@10 | P@50 | P@100 | AP | ER precision / F1 |
+|---|---|---|---|---|---|---|
+| Sealed test | shipped, no labels | 0 | 0 | 0 | 0 | 0.21 / 0.076 |
+| Sealed test | shipped, fitted on the test's own labels | 0.70 | 0.62 | 0.53 | 0.56 | 0.21 / 0.076 |
+| Sealed test | this branch, no labels | **1.00** | **0.80** | **0.70** | **0.76** | **0.96 / 0.107** |
+| Fresh window | this branch, no labels | **1.00** | **0.90** | 0.51 | **0.97** | **0.97 / 0.119** |
+
+**Still open.** Only ~10% of illicit activity reaches the queue: risk propagation needs seeds (9–17 per window,
+covering about a third of campaigns), and neither anomaly scorer carries signal on realistic data. Finding
+unseeded crime needs a better unsupervised signal; that is the next piece of work.

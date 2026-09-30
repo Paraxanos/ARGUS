@@ -23,26 +23,27 @@ from argus.detectors.coinjoin import CoinjoinRound
 from argus.detectors.peeling import PeelingChain
 
 
-def peeling_chain_rows(chains: list[PeelingChain]) -> list[dict]:
+def peeling_chain_rows(chains: list[PeelingChain], behaviour: dict[str, dict] | None = None) -> list[dict]:
+    """behaviour (argus.detectors.peeling.chain_behaviour_scores), when given, replaces each chain's structural
+    confidence with its behavioural score and records the cash-out / service-source evidence."""
     rows = []
     for chain in chains:
         reason_code = f"PEEL_CHAIN_HOPS={chain.hop_count}"
-        evidence_json = json.dumps(
-            {
-                "chain_id": chain.chain_id,
-                "hop_count": chain.hop_count,
-                "txids": chain.txids,
-                "wallets": chain.wallets,
-            }
-        )
+        b = (behaviour or {}).get(chain.chain_id)
+        evidence = {"chain_id": chain.chain_id, "hop_count": chain.hop_count, "txids": chain.txids, "wallets": chain.wallets}
+        if b is not None:
+            evidence.update({"swept_fraction": b["swept_fraction"], "service_source": b["service_source"]})
+        evidence_json = json.dumps(evidence)
+        score = b["score"] if b is not None else chain.confidence
         for node_id in (*chain.wallets, *chain.txids):
-            rows.append(
-                {"node_id": node_id, "score": chain.confidence, "reason_code": reason_code, "evidence_json": evidence_json}
-            )
+            rows.append({"node_id": node_id, "score": score, "reason_code": reason_code, "evidence_json": evidence_json})
     return rows
 
 
-def coinjoin_round_rows(rounds: list[CoinjoinRound]) -> list[dict]:
+def coinjoin_round_rows(rounds: list[CoinjoinRound], participant_factor: float = 1.0) -> list[dict]:
+    """participant_factor scales the score: taking part in a CoinJoin is a privacy practice and a mixing SIGNAL,
+    not evidence of crime on its own (it becomes strong only together with taint from a known-bad source, which is
+    fusion's job). 1.0 keeps the previous behaviour."""
     rows = []
     for r in rounds:
         reason_code = f"COINJOIN_ROUND_N={r.participant_count}"
@@ -55,7 +56,7 @@ def coinjoin_round_rows(rounds: list[CoinjoinRound]) -> list[dict]:
                 "output_wallets": r.output_wallets,
             }
         )
-        score = r.equal_output_fraction
+        score = r.equal_output_fraction * participant_factor
         node_ids = {r.txid, *r.input_wallets, *r.output_wallets}
         for node_id in node_ids:
             rows.append({"node_id": node_id, "score": score, "reason_code": reason_code, "evidence_json": evidence_json})

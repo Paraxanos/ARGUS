@@ -18,6 +18,8 @@ from dataclasses import dataclass
 
 import igraph as ig
 
+from argus.er.union_find import is_coinjoin_like
+
 DAMPING = 0.85  # standard PageRank damping factor
 DISTANCE_DECAY = 0.5  # explicit per-hop score multiplier, on top of PPR's own implicit decay
 
@@ -121,6 +123,116 @@ def compute_risk_scores(g: ig.Graph, seed_wallet_ids: list[str], damping: float 
             r.score = r.score / max_final
 
     return raw
+
+
+# --- Money-flow taint (haircut model) ------------------------------------------------------------------------
+# Ownership edges (CO_SPEND / SAME_ENTITY) say who *is* the same actor; they say nothing about where a known-bad
+# actor's money WENT. The forensics literature follows funds instead (taint analysis: poison / haircut / FIFO
+# models; e.g. Moser, Bohme & Breuker 2014). This implements the haircut model:
+#   * transactions are processed in time order, so taint only flows forward (a victim who paid a criminal is not
+#     tainted by the criminal; the criminal's later spends are);
+#   * an ordinary transaction's inputs belong to one actor (common-input ownership), so it carries the full taint
+#     of its most tainted input and its co-spent input addresses become tainted too; only a CoinJoin-shaped
+#     transaction (inputs from different participants) splits taint by value share (haircut); every hop also
+#     applies a decay that encodes growing uncertainty with distance;
+#   * every output wallet inherits that taint (max over the transactions that paid it);
+#   * extreme-fan-out "service" wallets (exchanges, payment processors) absorb taint but do not pass it on —
+#     otherwise one deposit taints an exchange's thousands of unrelated customers. "Extreme" is defined
+#     relative to each run's own degree distribution (a quantile), never as an absolute count.
+FLOW_DECAY = 0.9            # per-transaction-hop decay
+FLOW_MIN_TAINT = 0.01       # stop tracking below this share
+FLOW_MAX_HOPS = 8
+SERVICE_DEGREE_QUANTILE = 0.999
+
+
+def _tx_flows(g: ig.Graph):
+    """(timestamp, txid, [(input_wallet, amount)], [(output_wallet, amount)]) per transaction, time-ordered."""
+    names, types = g.vs["name"], g.vs["type"]
+    ins: dict[int, list] = {}
+    outs: dict[int, list] = {}
+    ts: dict[int, object] = {}
+    for (s, t), et, amt, stamp in zip(g.get_edgelist(), g.es["type"], g.es["amount"], g.es["timestamp"]):
+        if et == "FUNDS":
+            ins.setdefault(t, []).append((names[s], float(amt or 0.0)))
+        elif et == "PAYS":
+            outs.setdefault(s, []).append((names[t], float(amt or 0.0)))
+        elif et == "BROADCAST_VIA":
+            ts[s] = stamp
+    txs = [v for v in range(g.vcount()) if types[v] == "Transaction"]
+    rows = [(ts.get(v), names[v], ins.get(v, []), outs.get(v, [])) for v in txs]
+    rows.sort(key=lambda r: (r[0] is None, r[0], r[1]))
+    return rows
+
+
+def compute_flow_taint(g: ig.Graph, seed_wallet_ids: list[str]) -> list[RiskScore]:
+    flows = _tx_flows(g)
+    degree: dict[str, int] = {}
+    for _, _, ins, outs in flows:
+        for w, _ in ins + outs:
+            degree[w] = degree.get(w, 0) + 1
+    if not degree:
+        return []
+    ordered = sorted(degree.values())
+    cutoff = ordered[min(len(ordered) - 1, int(SERVICE_DEGREE_QUANTILE * len(ordered)))]
+    service = {w for w, d in degree.items() if d > cutoff}
+
+    taint: dict[str, float] = {w: 1.0 for w in seed_wallet_ids}
+    hops: dict[str, int] = {w: 0 for w in seed_wallet_ids}
+    parent: dict[str, tuple[str, str]] = {}          # node -> (via tx or wallet, previous node)
+    tx_taint: dict[str, tuple[float, int, str]] = {}  # txid -> (taint, hops, tainted input wallet)
+    for _, txid, ins, outs in flows:
+        total_in = sum(a for _, a in ins)
+        if total_in <= 0:
+            continue
+        tainted = [(w, a, taint[w]) for w, a in ins if w in taint and w not in service]
+        if not tainted:
+            continue
+        src_wallet = max(tainted, key=lambda c: c[2])[0]
+        h = hops[src_wallet] + 1
+        if is_coinjoin_like([w for w, _ in ins], [a for _, a in outs]):
+            # inputs belong to different participants: only the tainted share of the value carries taint
+            t = FLOW_DECAY * sum(a * s for _, a, s in tainted) / total_in
+        else:
+            # ordinary transaction: common-input ownership says every input belongs to the same actor, so the whole
+            # transaction (and every co-spent input address) carries that actor's taint
+            t = FLOW_DECAY * max(s for _, _, s in tainted)
+            for w, _ in ins:
+                if w not in service and taint.get(w, 0.0) < t:
+                    taint[w], hops[w], parent[w] = t, h, (txid, src_wallet)
+        if t < FLOW_MIN_TAINT or h > FLOW_MAX_HOPS:
+            continue
+        if t > tx_taint.get(txid, (0.0,))[0]:
+            tx_taint[txid] = (t, h, src_wallet)
+        for w, _ in outs:
+            if t > taint.get(w, 0.0):
+                taint[w], hops[w], parent[w] = t, h, (txid, src_wallet)
+
+    def path_to(node: str) -> list[str]:
+        path, cur, guard = [node], node, 0
+        while cur in parent and guard < 4 * FLOW_MAX_HOPS:
+            txid, prev = parent[cur]
+            path[:0] = [prev, txid]
+            cur, guard = prev, guard + 1
+        return path
+
+    seeds = set(seed_wallet_ids)
+    out: list[RiskScore] = []
+    for w, t in taint.items():
+        p = path_to(w)
+        out.append(RiskScore(node_id=w, score=t, seed_distance=hops[w], nearest_seed=p[0] if p[0] in seeds else w, path=p))
+    for txid, (t, h, src) in tx_taint.items():
+        p = path_to(src) + [txid]
+        out.append(RiskScore(node_id=txid, score=t, seed_distance=h, nearest_seed=p[0], path=p))
+    return out
+
+
+def combine_risk(ownership: list[RiskScore], flow: list[RiskScore]) -> list[RiskScore]:
+    """Per node, keep whichever signal is stronger (ownership propagation or money-flow taint)."""
+    best: dict[str, RiskScore] = {}
+    for r in ownership + flow:
+        if r.node_id not in best or r.score > best[r.node_id].score:
+            best[r.node_id] = r
+    return list(best.values())
 
 
 def risk_score_rows(scores: list[RiskScore]) -> list[dict]:
